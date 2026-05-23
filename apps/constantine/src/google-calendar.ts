@@ -197,7 +197,7 @@ export async function handleCalendarBackfill(c: Context): Promise<Response> {
       await sql`
         UPDATE bookings
         SET google_event_id = ${googleId}, google_calendar_id = ${calId},
-            google_synced_at = now(), google_sync_source = 'push'
+            google_synced_at = now(), google_sync_source = 'pushed'
         WHERE id = ${bk.id}
       `;
       created++;
@@ -388,7 +388,7 @@ export async function handleCalendarPush(c: Context): Promise<Response> {
   if (body.action === 'create' || !bk.google_event_id) {
     const { id, htmlLink } = await createCalendarEvent({ accessToken, calendarId: calId, event });
     await sql`
-      UPDATE bookings SET google_event_id = ${id}, google_calendar_id = ${calId}, google_synced_at = now(), google_sync_source = 'push'
+      UPDATE bookings SET google_event_id = ${id}, google_calendar_id = ${calId}, google_synced_at = now(), google_sync_source = 'pushed'
       WHERE id = ${body.booking_id}
     `;
     return c.json({ ok: true, id, htmlLink });
