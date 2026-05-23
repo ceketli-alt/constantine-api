@@ -361,7 +361,9 @@ export async function handleCalendarPush(c: Context): Promise<Response> {
       await deleteCalendarEvent({ accessToken, calendarId: calId, eventId: bk.google_event_id });
       await sql`UPDATE bookings SET google_event_id = NULL, google_calendar_id = NULL, google_synced_at = NULL WHERE id = ${body.booking_id}`;
     }
-    return c.json({ ok: true });
+    // Frontend `action: 'deleted'` field'ı bekliyor — yoksa "unexpected response" 'failed' döner
+    // ve Bookings sayfasındaki delete mutation DB delete'i atmaz (orphan-prevention guard).
+    return c.json({ ok: true, action: 'deleted' });
   }
 
   // Build event — bk.date Date objesi de olabilir, ISO timestamp string de.
@@ -397,10 +399,10 @@ export async function handleCalendarPush(c: Context): Promise<Response> {
       UPDATE bookings SET google_event_id = ${id}, google_calendar_id = ${calId}, google_synced_at = now(), google_sync_source = 'pushed'
       WHERE id = ${body.booking_id}
     `;
-    return c.json({ ok: true, id, htmlLink });
+    return c.json({ ok: true, action: 'created', id, htmlLink });
   }
 
   await updateCalendarEvent({ accessToken, calendarId: calId, eventId: bk.google_event_id, event });
   await sql`UPDATE bookings SET google_synced_at = now() WHERE id = ${body.booking_id}`;
-  return c.json({ ok: true, id: bk.google_event_id, updated: true });
+  return c.json({ ok: true, action: 'updated', id: bk.google_event_id, updated: true });
 }
