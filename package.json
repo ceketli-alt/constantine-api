@@ -1,0 +1,21 @@
+{
+  "name": "constantine-api-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Backend API workspace for Constantine ecosystem (ibrahim-acente, concierge-connect, constantine)",
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@9.15.9",
+  "scripts": {
+    "dev:ibrahim": "pnpm --filter @api/ibrahim dev",
+    "dev:concierge": "pnpm --filter @api/concierge dev",
+    "dev:constantine": "pnpm --filter @api/constantine dev",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "db:studio": "pnpm --filter @api/db studio"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2"
+  }
+}
