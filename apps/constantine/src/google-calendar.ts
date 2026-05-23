@@ -148,9 +148,11 @@ export async function handleCalendarBackfill(c: Context): Promise<Response> {
   const rows = await sql`
     SELECT b.id, b.boat_id, b.date, b.start_time, b.duration_hours, b.guest_name, b.contact,
            b.adult, b.child, b.infant, b.notes,
-           bo.google_calendar_id AS boat_cal_id, bo.name AS boat_name
+           bo.google_calendar_id AS boat_cal_id, bo.name AS boat_name,
+           ch.name AS channel_name
     FROM bookings b
     JOIN boats bo ON bo.id = b.boat_id
+    LEFT JOIN channels ch ON ch.id = b.channel_id
     WHERE b.google_event_id IS NULL
       AND b.status != 'cancelled'
       AND b.approval_status != 'rejected'
@@ -180,8 +182,9 @@ export async function handleCalendarBackfill(c: Context): Promise<Response> {
       const dur = Number(bk.duration_hours || 2);
       const end = new Date(start.getTime() + dur * 3600_000);
       const adult = Number(bk.adult || 0), child = Number(bk.child || 0), infant = Number(bk.infant || 0);
+      const channelPrefix = bk.channel_name ? `[${bk.channel_name}] ` : '';
       const event = {
-        summary: bk.guest_name || '(misafir)',
+        summary: `${channelPrefix}${bk.guest_name || '(misafir)'}`,
         description: [
           `Misafir: ${bk.guest_name || ''}`,
           bk.contact ? `İletişim: ${bk.contact}` : '',
@@ -323,9 +326,11 @@ export async function handleCalendarPush(c: Context): Promise<Response> {
     SELECT b.id, b.boat_id, b.date, b.start_time, b.duration_hours, b.guest_name, b.contact,
            b.adult, b.child, b.infant, b.notes, b.google_event_id, b.google_calendar_id,
            bo.google_calendar_id AS boat_cal_id, bo.name AS boat_name,
-           bo.google_calendar_connected AS boat_connected
+           bo.google_calendar_connected AS boat_connected,
+           ch.name AS channel_name
     FROM bookings b
     JOIN boats bo ON bo.id = b.boat_id
+    LEFT JOIN channels ch ON ch.id = b.channel_id
     WHERE b.id = ${body.booking_id}
   `;
   const bk = rows[0];
@@ -373,8 +378,9 @@ export async function handleCalendarPush(c: Context): Promise<Response> {
   const dur = Number(bk.duration_hours || 2);
   const end = new Date(start.getTime() + dur * 3600_000);
   const adult = Number(bk.adult || 0), child = Number(bk.child || 0), infant = Number(bk.infant || 0);
+  const channelPrefix = bk.channel_name ? `[${bk.channel_name}] ` : '';
   const event = {
-    summary: bk.guest_name || '(misafir)',
+    summary: `${channelPrefix}${bk.guest_name || '(misafir)'}`,
     description: [
       `Misafir: ${bk.guest_name || ''}`,
       bk.contact ? `İletişim: ${bk.contact}` : '',
