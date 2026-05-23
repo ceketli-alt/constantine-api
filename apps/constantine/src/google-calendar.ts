@@ -126,6 +126,90 @@ export async function handleCalendarPull(c: Context): Promise<Response> {
   return c.json({ events: allPreviews, failed_boats: failedBoats });
 }
 
+/**
+ * handleCalendarBackfill — admin tool: tüm `google_event_id IS NULL` bookingleri
+ * sırayla Google Calendar'a push eder. Sadece bağlı tekneler. super_admin gerek.
+ * Body: { dry_run?: boolean, date_from?: 'yyyy-MM-dd' }
+ */
+export async function handleCalendarBackfill(c: Context): Promise<Response> {
+  const auth = requireAuth(c);
+  if (!auth) return c.json({ error: 'unauthorized' }, 401);
+
+  const prof = await sql`SELECT role::text AS role FROM profiles WHERE id = ${auth.userId}`;
+  if (prof[0]?.role !== 'super_admin') return c.json({ error: 'forbidden' }, 403);
+
+  const body = await c.req.json().catch(() => ({})) as { dry_run?: boolean; date_from?: string };
+
+  const boats = await sql`SELECT id FROM boats WHERE google_calendar_connected = true AND active = true`;
+  const connectedIds = boats.map((b: any) => b.id);
+  if (connectedIds.length === 0) return c.json({ note: 'no connected boats', processed: 0 });
+
+  const dateFromFilter = body.date_from ?? '1970-01-01';
+  const rows = await sql`
+    SELECT b.id, b.boat_id, b.date, b.start_time, b.duration_hours, b.guest_name, b.contact,
+           b.adult, b.child, b.infant, b.notes,
+           bo.google_calendar_id AS boat_cal_id, bo.name AS boat_name
+    FROM bookings b
+    JOIN boats bo ON bo.id = b.boat_id
+    WHERE b.google_event_id IS NULL
+      AND b.status != 'cancelled'
+      AND b.approval_status != 'rejected'
+      AND b.date >= ${dateFromFilter}
+      AND b.boat_id = ANY(${connectedIds}::uuid[])
+    ORDER BY b.date DESC
+  `;
+
+  if (body.dry_run) {
+    return c.json({
+      would_push: rows.length,
+      sample: rows.slice(0, 5).map((r: any) => ({ id: r.id, date: String(r.date).slice(0,10), boat: r.boat_name, guest: r.guest_name })),
+    });
+  }
+
+  let created = 0, failed = 0;
+  const errors: any[] = [];
+
+  for (const bk of rows as any[]) {
+    try {
+      const datePart = (bk.date instanceof Date) ? bk.date.toISOString().slice(0, 10) : String(bk.date).slice(0, 10);
+      const timePart = (bk.start_time && String(bk.start_time).slice(0, 8)) || '12:00:00';
+      const start = new Date(`${datePart}T${timePart}`);
+      if (Number.isNaN(start.getTime())) {
+        failed++; errors.push({ id: bk.id, reason: 'invalid_date', date: String(bk.date) }); continue;
+      }
+      const dur = Number(bk.duration_hours || 2);
+      const end = new Date(start.getTime() + dur * 3600_000);
+      const adult = Number(bk.adult || 0), child = Number(bk.child || 0), infant = Number(bk.infant || 0);
+      const event = {
+        summary: bk.guest_name || '(misafir)',
+        description: [
+          `Misafir: ${bk.guest_name || ''}`,
+          bk.contact ? `İletişim: ${bk.contact}` : '',
+          `Kişi: ${adult}A/${child}C/${infant}I`,
+          bk.notes ? `Not: ${bk.notes}` : '',
+        ].filter(Boolean).join('\n'),
+        start: { dateTime: start.toISOString(), timeZone: 'Europe/Istanbul' },
+        end: { dateTime: end.toISOString(), timeZone: 'Europe/Istanbul' },
+      };
+      const calId = bk.boat_cal_id || 'primary';
+      const accessToken = await getAccessTokenForBoat(bk.boat_id);
+      const { id: googleId } = await createCalendarEvent({ accessToken, calendarId: calId, event });
+      await sql`
+        UPDATE bookings
+        SET google_event_id = ${googleId}, google_calendar_id = ${calId},
+            google_synced_at = now(), google_sync_source = 'push'
+        WHERE id = ${bk.id}
+      `;
+      created++;
+    } catch (err: any) {
+      failed++;
+      errors.push({ id: bk.id, guest: bk.guest_name, reason: err?.message ?? String(err) });
+    }
+  }
+
+  return c.json({ processed: rows.length, created, failed, errors: errors.slice(0, 20) });
+}
+
 interface ImportRow {
   google_event_id: string;
   google_calendar_id: string;

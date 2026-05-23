@@ -22,7 +22,7 @@ import { handleFunctionStub, listFunctions } from './functions-stub.js';
 import { handleStorageProxy } from './storage-proxy.js';
 import { handleResendWebhook } from './email-webhook.js';
 import { handleGoogleOAuthCallback } from './google-oauth.js';
-import { handleCalendarPull, handleCalendarPush, handleCalendarImport } from './google-calendar.js';
+import { handleCalendarPull, handleCalendarPush, handleCalendarImport, handleCalendarBackfill } from './google-calendar.js';
 import { sendTestEmail, sendEmail } from './resend-send.js';
 import {
   verifyAnyJWT,
@@ -246,6 +246,7 @@ app.get('/functions/v1/google-oauth-callback', (c) => handleGoogleOAuthCallback(
 app.post('/functions/v1/google-calendar-pull', (c) => handleCalendarPull(c));
 app.post('/functions/v1/google-calendar-push', (c) => handleCalendarPush(c));
 app.post('/functions/v1/google-calendar-import', (c) => handleCalendarImport(c));
+app.post('/functions/v1/google-calendar-backfill', (c) => handleCalendarBackfill(c));
 
 // Test mail at — auth'la korumalı, sadece super_admin
 app.post('/functions/v1/email-test', async (c) => {
