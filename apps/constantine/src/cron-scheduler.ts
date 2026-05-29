@@ -1,0 +1,238 @@
+/**
+ * Cron scheduler — in-process node-cron tabanlı.
+ *
+ * Schedule'lar (UTC):
+ *   - warmup-tick: her gün 00:00 UTC (= 03:00 TR) — campaign-worker daily cap window ile aligned
+ *   - recompute-scores: her 15 dakikada bir
+ *
+ * Henüz port edilmemiş cron'lar:
+ *   - cron-daily-digest (operasyon günlük raporu) — Faz 3.5
+ *   - cron-overdue (geciken booking/task notify) — Faz 3.5
+ *   - cron-recurring (aylık expense/task instantiate) — Faz 3.5
+ *
+ * Her cron job için bir last_run_at değeri `app_config` tablosuna yazılır
+ * (UI'da EmailSettings'teki "son cron tick" göstergesi için).
+ */
+import cron, { type ScheduledTask } from 'node-cron';
+import { sql } from './db.js';
+import { runWarmupTick } from './cron-warmup-tick.js';
+import { runRecomputeScores } from './cron-recompute-scores.js';
+import { runSalesDailyDigest } from './cron-daily-digest.js';
+import { runOpsDailyDigest } from './daily-digest.js';
+
+let warmupTask: ScheduledTask | null = null;
+let scoresTask: ScheduledTask | null = null;
+let overdueTask: ScheduledTask | null = null;
+let recurringTask: ScheduledTask | null = null;
+let digestTask: ScheduledTask | null = null;
+let opsDigestTask: ScheduledTask | null = null;
+let opsEveningDigestTask: ScheduledTask | null = null;
+
+async function loadCronEnabled(): Promise<boolean> {
+  try {
+    const rows = await sql`
+      SELECT value FROM app_config WHERE key = 'sales.cron_enabled'
+    `;
+    if (rows.length === 0) return true; // default açık
+    const v = rows[0]?.value;
+    if (typeof v === 'boolean') return v;
+    if (typeof v === 'string') return v === 'true' || v === '1';
+    if (typeof v === 'object' && v !== null && 'enabled' in (v as any)) {
+      return !!(v as any).enabled;
+    }
+    return true;
+  } catch {
+    return true;
+  }
+}
+
+async function writeLastRun(key: string, payload: Record<string, unknown>): Promise<void> {
+  try {
+    await sql`
+      INSERT INTO app_config (key, value)
+      VALUES (${key}, ${sql.json({ ...payload, at: new Date().toISOString() })})
+      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+    `;
+  } catch (e: any) {
+    console.warn(`[cron-scheduler] writeLastRun(${key}) skipped:`, e.message);
+  }
+}
+
+async function safeRunWarmup(): Promise<void> {
+  if (!(await loadCronEnabled())) {
+    console.log('[cron-scheduler] cron disabled, warmup skipped');
+    return;
+  }
+  console.log('[cron-scheduler] running warmup-tick...');
+  try {
+    const result = await runWarmupTick();
+    console.log(`[cron-scheduler] warmup-tick OK: ticked=${result.ticked}`);
+    await writeLastRun('sales.cron.last_warmup_tick', { ticked: result.ticked });
+  } catch (e: any) {
+    console.error('[cron-scheduler] warmup-tick error:', e?.message);
+    await writeLastRun('sales.cron.last_warmup_tick', { error: e?.message ?? 'unknown' });
+  }
+}
+
+async function safeRunScores(): Promise<void> {
+  if (!(await loadCronEnabled())) {
+    return;
+  }
+  try {
+    const result = await runRecomputeScores();
+    if (result.processed > 0) {
+      console.log(`[cron-scheduler] scores: processed=${result.processed} changed=${result.changed} new_hot=${result.new_hot}`);
+    }
+    await writeLastRun('sales.cron.last_score_recompute', {
+      processed: result.processed,
+      changed: result.changed,
+      new_hot: result.new_hot,
+    });
+  } catch (e: any) {
+    console.error('[cron-scheduler] scores error:', e?.message);
+    await writeLastRun('sales.cron.last_score_recompute', { error: e?.message ?? 'unknown' });
+  }
+}
+
+/** Geciken görevleri tara, task_overdue activity_events ekle. DB'deki fn_log_task_overdue() */
+export async function runOverdueTick(): Promise<{ ok: true }> {
+  try {
+    await sql`SELECT fn_log_task_overdue()`;
+    await writeLastRun('cron.last_task_overdue', { ok: true });
+  } catch (e: any) {
+    console.error('[cron-scheduler] overdue error:', e?.message);
+    await writeLastRun('cron.last_task_overdue', { error: e?.message ?? 'unknown' });
+  }
+  return { ok: true };
+}
+
+/** Sales daily digest — TR 08:00 sabah maili (super_admin + partner) */
+async function safeRunSalesDigest(): Promise<void> {
+  if (!(await loadCronEnabled())) {
+    console.log('[cron-scheduler] cron disabled, sales digest skipped');
+    return;
+  }
+  console.log('[cron-scheduler] running sales daily digest...');
+  try {
+    const result = await runSalesDailyDigest();
+    console.log(`[cron-scheduler] sales digest OK: sent=${result.sent} skipped=${result.skipped} errors=${result.errors.length}`);
+    await writeLastRun('sales.cron.last_daily_digest', {
+      sent: result.sent,
+      skipped: result.skipped,
+      errors: result.errors.length,
+      reason: result.reason,
+      counts: result.counts,
+    });
+  } catch (e: any) {
+    console.error('[cron-scheduler] sales digest error:', e?.message);
+    await writeLastRun('sales.cron.last_daily_digest', { error: e?.message ?? 'unknown' });
+  }
+}
+
+/** Operations daily digest — role-aware mail (super_admin/partner/captain/crew + opt-in)
+ *  variant='morning' (TR 09:00): bugün odaklı
+ *  variant='evening' (TR 23:00): yarın hazırlık
+ */
+async function safeRunOpsDigest(variant: 'morning' | 'evening'): Promise<void> {
+  if (!(await loadCronEnabled())) {
+    console.log(`[cron-scheduler] cron disabled, ops digest (${variant}) skipped`);
+    return;
+  }
+  console.log(`[cron-scheduler] running ops daily digest (${variant})...`);
+  try {
+    const result = await runOpsDailyDigest(null, variant);
+    console.log(`[cron-scheduler] ops digest ${variant} OK: sent=${result.sent} failed=${result.failed}`);
+    await writeLastRun(`ops.cron.last_daily_digest_${variant}`, {
+      sent: result.sent,
+      failed: result.failed,
+      reason: result.reason,
+    });
+  } catch (e: any) {
+    console.error(`[cron-scheduler] ops digest (${variant}) error:`, e?.message);
+    await writeLastRun(`ops.cron.last_daily_digest_${variant}`, { error: e?.message ?? 'unknown' });
+  }
+}
+
+/** Tekrarlı görev + gider şablonlarını instantiate et. DB'deki generate_recurring_tasks/_expenses() */
+export async function runRecurringTick(): Promise<{ ok: true; tasks?: number; expenses?: number }> {
+  let tasks = 0;
+  let expenses = 0;
+  try {
+    const rTasks = await sql`SELECT generate_recurring_tasks() AS n`;
+    tasks = Number(rTasks[0]?.n ?? 0);
+  } catch (e: any) {
+    console.error('[cron-scheduler] recurring tasks error:', e?.message);
+  }
+  try {
+    const rExpenses = await sql`SELECT generate_recurring_expenses() AS n`;
+    expenses = Number(rExpenses[0]?.n ?? 0);
+  } catch (e: any) {
+    console.error('[cron-scheduler] recurring expenses error:', e?.message);
+  }
+  await writeLastRun('cron.last_recurring', { tasks, expenses });
+  return { ok: true, tasks, expenses };
+}
+
+export function startCronScheduler(): void {
+  if (warmupTask || scoresTask) {
+    console.warn('[cron-scheduler] already started');
+    return;
+  }
+
+  // warmup-tick: her gün 00:00 UTC — Backend B6 fix: campaign-worker daily cap window
+  // (UTC midnight'a göre count) ile align edilmiş; eskiden 00:05'ti, 5dk pencerede
+  // worker yeni günü saymaya başlamış, warmup henüz sent_today reset etmemiş oluyordu.
+  warmupTask = cron.schedule('0 0 * * *', () => {
+    safeRunWarmup().catch((e) => console.error('[cron-scheduler] warmup unhandled:', e?.message));
+  }, { timezone: 'UTC' });
+
+  // recompute-scores: her 15 dakikada bir
+  scoresTask = cron.schedule('*/15 * * * *', () => {
+    safeRunScores().catch((e) => console.error('[cron-scheduler] scores unhandled:', e?.message));
+  }, { timezone: 'UTC' });
+
+  // task-overdue: her gün 00:00 UTC (TR 03:00)
+  overdueTask = cron.schedule('0 0 * * *', () => {
+    runOverdueTick().catch((e) => console.error('[cron-scheduler] overdue unhandled:', e?.message));
+  }, { timezone: 'UTC' });
+
+  // recurring tasks + expenses: her gün 00:00 UTC (TR 03:00)
+  recurringTask = cron.schedule('0 0 * * *', () => {
+    runRecurringTick().catch((e) => console.error('[cron-scheduler] recurring unhandled:', e?.message));
+  }, { timezone: 'UTC' });
+
+  // sales daily digest: her gün 05:00 UTC (= TR 08:00 sabah)
+  digestTask = cron.schedule('0 5 * * *', () => {
+    safeRunSalesDigest().catch((e) => console.error('[cron-scheduler] sales digest unhandled:', e?.message));
+  }, { timezone: 'UTC' });
+
+  // ops daily digest — morning: 06:00 UTC = TR 09:00 sabah
+  opsDigestTask = cron.schedule('0 6 * * *', () => {
+    safeRunOpsDigest('morning').catch((e) => console.error('[cron-scheduler] ops morning unhandled:', e?.message));
+  }, { timezone: 'UTC' });
+
+  // ops daily digest — evening: 20:00 UTC = TR 23:00 gece (yarın hazırlık)
+  opsEveningDigestTask = cron.schedule('0 20 * * *', () => {
+    safeRunOpsDigest('evening').catch((e) => console.error('[cron-scheduler] ops evening unhandled:', e?.message));
+  }, { timezone: 'UTC' });
+
+  console.log('[cron-scheduler] scheduled:');
+  console.log('  - warmup-tick: cron("0 0 * * *", UTC)');
+  console.log('  - recompute-scores: cron("*/15 * * * *", UTC)');
+  console.log('  - task-overdue: cron("0 0 * * *", UTC)');
+  console.log('  - recurring (tasks+expenses): cron("0 0 * * *", UTC)');
+  console.log('  - sales daily digest: cron("0 5 * * *", UTC = TR 08:00)');
+  console.log('  - ops daily digest [morning]: cron("0 6 * * *", UTC = TR 09:00)');
+  console.log('  - ops daily digest [evening]: cron("0 20 * * *", UTC = TR 23:00)');
+}
+
+export function stopCronScheduler(): void {
+  if (warmupTask) { warmupTask.stop(); warmupTask = null; }
+  if (scoresTask) { scoresTask.stop(); scoresTask = null; }
+  if (overdueTask) { overdueTask.stop(); overdueTask = null; }
+  if (recurringTask) { recurringTask.stop(); recurringTask = null; }
+  if (digestTask) { digestTask.stop(); digestTask = null; }
+  if (opsDigestTask) { opsDigestTask.stop(); opsDigestTask = null; }
+  if (opsEveningDigestTask) { opsEveningDigestTask.stop(); opsEveningDigestTask = null; }
+  console.log('[cron-scheduler] stopped');
+}

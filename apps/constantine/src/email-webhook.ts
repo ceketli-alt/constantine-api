@@ -26,7 +26,9 @@ const RESEND_WEBHOOK_SECRET = process.env.RESEND_WEBHOOK_SECRET || '';
  * Format: "v1,<base64>"  multiple separated by space
  */
 function verifySvixSignature(payload: string, headers: { id: string; timestamp: string; signature: string }, secret: string): boolean {
-  if (!secret || !secret.startsWith('whsec_')) return true; // dev mode: secret yoksa skip
+  // Fail closed — caller secret'ı pre-validate eder, buraya boş gelmemeli.
+  if (!secret || !secret.startsWith('whsec_')) return false;
+  if (!headers.id || !headers.timestamp || !headers.signature) return false;
   const secretBytes = Buffer.from(secret.replace('whsec_', ''), 'base64');
   const signedContent = `${headers.id}.${headers.timestamp}.${payload}`;
   const computed = crypto.createHmac('sha256', secretBytes).update(signedContent).digest('base64');
@@ -48,18 +50,31 @@ const EVENT_TYPE_MAP: Record<string, string> = {
   'email.failed':     'failed',
 };
 
+/**
+ * email_event_type enum'unun KABUL ETTİĞİ değerler (sprint_2'de bilinçli dar tutuldu).
+ * Resend bunların DIŞINDA da event yollar (email.sent / email.delivery_delayed /
+ * email.failed) — bunlar email_events'e YAZILMAZ: enum dışı oldukları için
+ * `::email_event_type` cast'i hata atar (önceden INSERT patlıyor → 500 → Resend retry).
+ * Side-effect'leri de yok ('sent' zaten email_messages.sent_at'te; 'failed'/'delivery_delayed'
+ * send-side, ayrı izleniyor) → sadece 200 ack döneriz. Bu liste DB enum'uyla BİREBİR
+ * olmalı (drift guard: scripts/test-email-event-enum.mjs).
+ */
+export const PERSISTED_EVENT_TYPES = ['delivered', 'opened', 'clicked', 'bounced', 'complained', 'replied'] as const;
+
 export async function handleResendWebhook(c: Context): Promise<Response> {
   const raw = await c.req.text();
   const svixId = c.req.header('svix-id') ?? '';
   const svixTimestamp = c.req.header('svix-timestamp') ?? '';
   const svixSignature = c.req.header('svix-signature') ?? '';
 
-  if (RESEND_WEBHOOK_SECRET) {
-    const ok = verifySvixSignature(raw, { id: svixId, timestamp: svixTimestamp, signature: svixSignature }, RESEND_WEBHOOK_SECRET);
-    if (!ok) {
-      console.warn('[email-webhook] Invalid signature', { svixId });
-      return c.json({ error: 'invalid_signature' }, 401);
-    }
+  if (!RESEND_WEBHOOK_SECRET) {
+    console.error('[email-webhook] RESEND_WEBHOOK_SECRET not configured — rejecting webhook (fail-closed)');
+    return c.json({ error: 'webhook_not_configured' }, 503);
+  }
+  const ok = verifySvixSignature(raw, { id: svixId, timestamp: svixTimestamp, signature: svixSignature }, RESEND_WEBHOOK_SECRET);
+  if (!ok) {
+    console.warn('[email-webhook] Invalid signature', { svixId });
+    return c.json({ error: 'invalid_signature' }, 401);
   }
 
   let body: any;
@@ -79,12 +94,11 @@ export async function handleResendWebhook(c: Context): Promise<Response> {
       messageId = m[0]?.id ?? null;
     }
 
-    if (messageId) {
-      // Sadece eşleşen message varsa event kaydet (FK NOT NULL)
-      const eventTypeNorm = ['sent','delivered','opened','clicked','bounced','complained','failed','delivery_delayed'].includes(eventType) ? eventType : 'failed';
+    if (messageId && (PERSISTED_EVENT_TYPES as readonly string[]).includes(eventType)) {
+      // Eşleşen message + enum-geçerli tip → event kaydet (FK NOT NULL + email_event_type cast)
       await sql`
         INSERT INTO email_events (message_id, event_type, raw_payload, occurred_at)
-        VALUES (${messageId}, ${eventTypeNorm}::email_event_type, ${body}::jsonb, now())
+        VALUES (${messageId}, ${eventType}::email_event_type, ${body}::jsonb, now())
       `;
       // email_messages timestamp güncelle
       const stampCol = ({
@@ -96,14 +110,59 @@ export async function handleResendWebhook(c: Context): Promise<Response> {
       if (stampCol) {
         await sql.unsafe(`UPDATE email_messages SET ${stampCol} = now() WHERE id = $1`, [messageId]);
       }
-    } else {
+    } else if (!messageId) {
       console.log(`[email-webhook] message_id eşleşmedi (resend_id=${resendMessageId}), event drop`);
+    } else {
+      // Enum dışı tip (sent/delivery_delayed/failed/unknown): kaydetmeden ack — cast hatası önlenir.
+      // (bounced/complained PERSISTED'da → yukarıda kaydedilir; suppression aşağıda yine çalışır.)
+      console.log(`[email-webhook] event_type='${eventType}' email_event_type enum dışı → kaydedilmedi (ack)`);
     }
 
-    // Reply-status / lead temperature güncellemeleri
-    if (eventType === 'bounced' || eventType === 'complained') {
-      // bounced/complained → lead opt-out olabilir, ileride
-      console.log(`[email-webhook] ${eventType} for ${recipientEmail}`);
+    // ─── Hard bounce / spam complaint → suppression + lead opt-out ───
+    // Reputation koruması: bu adrese bir daha gönderme (follow-up dahil). email-send.ts
+    // send-time'da unsubscribes'i exact-match kontrol eder (channel IN ('email','all')),
+    // o yüzden lead'in STORED email'ini identifier yapıyoruz ki ileride tutsun.
+    // NOT: 'delivery_delayed' (geçici/soft) suppress EDİLMEZ — sadece kalıcı bounce + complaint.
+    if ((eventType === 'bounced' || eventType === 'complained') && recipientEmail) {
+      const reason = eventType === 'complained' ? 'spam_complaint' : 'hard_bounce';
+      try {
+        const leadRows = await sql`
+          SELECT id, primary_contact_email
+          FROM leads
+          WHERE lower(primary_contact_email) = lower(${recipientEmail})
+          LIMIT 1
+        `;
+        const suppressIdentifier: string = leadRows[0]?.primary_contact_email ?? recipientEmail;
+
+        // 1. Suppression registry (idempotent — UNIQUE(channel, identifier))
+        await sql`
+          INSERT INTO unsubscribes (channel, identifier, reason, source)
+          VALUES ('email', ${suppressIdentifier}, ${reason}, 'resend_webhook')
+          ON CONFLICT (channel, identifier) DO NOTHING
+        `;
+
+        // 2. Lead'i opt-out işaretle (bir daha campaign'e enroll olmasın) + 3. takipleri durdur
+        if (leadRows[0]?.id) {
+          const leadId: string = leadRows[0].id;
+          await sql`
+            UPDATE leads
+            SET status = 'opted_out',
+                opted_out_at = COALESCE(opted_out_at, now()),
+                opted_out_channel = 'email',
+                opted_out_reason = ${reason}
+            WHERE id = ${leadId}
+          `;
+          await sql`
+            UPDATE campaign_targets
+            SET status = 'opted_out', next_followup_at = NULL
+            WHERE lead_id = ${leadId} AND status IN ('queued', 'sent')
+          `;
+        }
+        console.log(`[email-webhook] ${eventType} → suppressed ${recipientEmail} (reason=${reason}, lead=${leadRows[0]?.id ?? 'none'})`);
+      } catch (suppressErr: any) {
+        // Suppression hatası event kaydını bozmasın — logla, 200 dön (Resend retry'ı önle)
+        console.error(`[email-webhook] suppress error for ${recipientEmail}:`, suppressErr?.message);
+      }
     }
 
     return c.json({ ok: true, event: eventType, messageId, resendMessageId });

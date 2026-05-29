@@ -48,12 +48,16 @@ export const authnMiddleware: MiddlewareHandler = async (c, next) => {
       });
       return next();
     } catch (e) {
-      return c.json({ message: 'Geçersiz JWT', code: 'invalid_jwt' }, 401);
+      // Bearer geçersiz: Supabase JS client login öncesi public endpoint'lere
+      // (recover, signup, token) anon key'i Bearer header'a koyabiliyor. Bu anon key
+      // bizim JWT_SECRET'ımızla imzalı değil → verify fail. 401 ATMIYORUZ, sessizce
+      // anon olarak devam — public route'lar açık kalır, korunan route'lar zaten
+      // `requireAuth(c)` ile içeride 401 atar. (2026-05-26 — Concierge ile parite)
     }
   }
 
-  // Bearer yoksa, apikey JWT formatında ise dene
-  if (apikeyHeader && apikeyHeader.startsWith('eyJ')) {
+  // Bearer yoksa veya geçersizse, apikey JWT formatında ise dene
+  if (!c.get('auth') && apikeyHeader && apikeyHeader.startsWith('eyJ')) {
     try {
       const claims = await verifyAnyJWT(apikeyHeader);
       c.set('auth', {

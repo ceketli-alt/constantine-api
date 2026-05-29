@@ -76,6 +76,19 @@ export async function issueRefreshToken(user: SessionUser): Promise<string> {
     .sign(ourSecret);
 }
 
+/** Refresh token verify — sadece kendi secret'imizle imzalanmış VE typ='refresh' olmalı.
+ *  Access token'la mix kullanılamaz (separation). */
+export async function verifyRefreshToken(token: string): Promise<{ sub: string }> {
+  const { payload } = await jwtVerify(token, ourSecret, { algorithms: ['HS256'] });
+  if (payload.typ !== 'refresh') {
+    throw new Error('Bu bir refresh token değil');
+  }
+  if (!payload.sub || typeof payload.sub !== 'string') {
+    throw new Error('Refresh token sub eksik');
+  }
+  return { sub: payload.sub };
+}
+
 export async function lookupUserByEmail(email: string): Promise<{ id: string; email: string; password_hash: string | null; role: string; active: boolean } | null> {
   const rows = await sql`
     SELECT u.id, u.email, u.password_hash, p.role::text AS role, p.active
@@ -87,24 +100,9 @@ export async function lookupUserByEmail(email: string): Promise<{ id: string; em
   return (rows[0] as any) ?? null;
 }
 
-/** Transparent migration: Supabase'e password kontrolü yap */
-const LEGACY_SUPABASE_URL = process.env.LEGACY_SUPABASE_URL || 'https://gueseggrlelvcoihrpjh.supabase.co';
-const LEGACY_SUPABASE_ANON = process.env.LEGACY_SUPABASE_ANON || '';
-
-export async function verifyAgainstLegacySupabase(email: string, password: string): Promise<boolean> {
-  if (!LEGACY_SUPABASE_ANON) return false;
-  try {
-    const res = await fetch(`${LEGACY_SUPABASE_URL}/auth/v1/token?grant_type=password`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'apikey': LEGACY_SUPABASE_ANON },
-      body: JSON.stringify({ email, password }),
-    });
-    return res.ok;
-  } catch (e) {
-    console.error('[auth] Legacy Supabase verify failed:', (e as Error).message);
-    return false;
-  }
-}
+// Transparent Supabase migration kaldırıldı (Faz 4 cleanup, 2026-05-24).
+// Eski Supabase password'unu kullanan kullanıcılar artık `/auth/v1/recover`
+// ile şifrelerini yenilemeli — backend lokal Argon2 hash bekliyor.
 
 export async function verifyPassword(plain: string, hash: string): Promise<boolean> {
   try { return await argon2.verify(hash, plain); } catch { return false; }

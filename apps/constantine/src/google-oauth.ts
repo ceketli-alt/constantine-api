@@ -80,10 +80,12 @@ export async function handleGoogleOAuthCallback(c: Context): Promise<Response> {
     }
 
     // CSRF state üret + kaydet
+    // Backend B8 fix: expires_at explicit set — DB default'una bel bağlama, eski state'ler
+    // replay edilebilirdi (callback'te `new Date(null) < new Date()` = false, hiç expire olmaz).
     const stateToken = crypto.randomUUID() + '-' + crypto.randomUUID();
     await sql`
-      INSERT INTO google_oauth_states (state, boat_id, user_id)
-      VALUES (${stateToken}, ${boatId}, ${auth.userId})
+      INSERT INTO google_oauth_states (state, boat_id, user_id, expires_at)
+      VALUES (${stateToken}, ${boatId}, ${auth.userId}, now() + interval '10 minutes')
     `;
 
     const authUrl = new URL(GOOGLE_OAUTH_AUTH_URL);

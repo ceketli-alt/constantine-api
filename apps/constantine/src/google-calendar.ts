@@ -83,10 +83,24 @@ export async function handleCalendarPull(c: Context): Promise<Response> {
   const allPreviews: any[] = [];
   const failedBoats: any[] = [];
 
+  // Backend B5 fix: token resolve race — Promise.all içinde paralel getAccessTokenForBoat
+  // çağrıları aynı boat için yapılırsa (örn. shared id veya idempotent re-entry) iki refresh
+  // birbirini ezerdi. Önce sequential token resolve, sonra parallel event fetch.
+  const tokensByBoat = new Map<string, string>();
+  for (const boat of boats) {
+    try {
+      tokensByBoat.set(boat.id, await getAccessTokenForBoat(boat.id));
+    } catch (err: any) {
+      console.error(`token resolve failed for boat ${boat.name}:`, err);
+      failedBoats.push({ boat_id: boat.id, boat_name: boat.name, error: err?.message ?? String(err) });
+    }
+  }
+
   await Promise.all(boats.map(async (boat: any) => {
+    const accessToken = tokensByBoat.get(boat.id);
+    if (!accessToken) return; // token resolve fail — failedBoats'a yukarıda eklendi
     const calId = boat.google_calendar_id || 'primary';
     try {
-      const accessToken = await getAccessTokenForBoat(boat.id);
       const events = await listCalendarEvents({ accessToken, calendarId: calId, timeMin, timeMax });
       for (const ev of events) {
         if (ev.status === 'cancelled') continue;

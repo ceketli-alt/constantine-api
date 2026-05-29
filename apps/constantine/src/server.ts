@@ -9,7 +9,7 @@
  *   /auth/v1/token   → password login
  *   /storage/v1/...  → (Faz 2: lokal disk + nginx)
  */
-import 'dotenv/config';
+import './load-env.js'; // ← MUST BE FIRST: .env'i tüm diğer import'lardan önce yükler (override:true)
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
@@ -18,19 +18,36 @@ import { secureHeaders } from 'hono/secure-headers';
 import { sql, withRequestContext } from './db.js';
 import { authnMiddleware, requireAuth } from './middleware.js';
 import { handleRest } from './rest.js';
-import { handleFunctionStub, listFunctions } from './functions-stub.js';
-import { handleStorageProxy } from './storage-proxy.js';
+// functions-stub.ts kaldırıldı (Faz 4 cleanup, 2026-05-24) — tüm fn'ler artık port edildi
+// storage-proxy decommissioned (Faz 4) — nginx artık /storage/v1/* için direkt /var/www/storage'tan serv ediyor
 import { handleResendWebhook } from './email-webhook.js';
+import { handleResendInbound } from './email-inbound.js';
+import { handleEmailSend } from './email-send.js';
+import { handleUnsubscribe } from './unsubscribe.js';
+import { handleReplyClassify } from './reply-classify.js';
+import { handleReplyDraft } from './reply-draft.js';
+import { handleIysCheck } from './iys-check.js';
+import { handleAgencyPanel } from './agency-panel.js';
+import { startCampaignWorker, stopCampaignWorker } from './campaign-worker.js';
+import { startCronScheduler, stopCronScheduler } from './cron-scheduler.js';
+import { startMailcowReplyPoller, stopMailcowReplyPoller } from './mailcow-reply-poller.js';
+import { handleWarmupTick } from './cron-warmup-tick.js';
+import { handleRecomputeScores } from './cron-recompute-scores.js';
+import { handleCronDailyDigest } from './cron-daily-digest.js';
+import { handleDailyDigest } from './daily-digest.js';
+import { handleWpSend } from './wp-send.js';
+import { handleWpWebhook } from './wp-webhook.js';
+import { handleMailMetrics, handleMailHealth, handleMailEvents } from './mail-metrics.js';
 import { handleGoogleOAuthCallback } from './google-oauth.js';
 import { handleCalendarPull, handleCalendarPush, handleCalendarImport, handleCalendarBackfill } from './google-calendar.js';
 import { sendTestEmail, sendEmail } from './resend-send.js';
 import {
   verifyAnyJWT,
+  verifyRefreshToken,
   lookupUserByEmail,
   verifyPassword,
   issueAccessToken,
   issueRefreshToken,
-  verifyAgainstLegacySupabase,
   hashPassword,
   setUserPassword,
 } from './auth.js';
@@ -82,64 +99,99 @@ app.use('*', authnMiddleware);
 // Auth endpoints — Supabase /auth/v1/* compat
 // ─────────────────────────────────────────────────────────
 
-// POST /auth/v1/token?grant_type=password
+// POST /auth/v1/token?grant_type=(password|refresh_token)
 app.post('/auth/v1/token', async (c) => {
   const grant = c.req.query('grant_type');
-  if (grant !== 'password') {
-    return c.json({ error: 'unsupported_grant_type', error_description: `grant_type=${grant} desteklenmiyor` }, 400);
-  }
   let body: any;
   try { body = await c.req.json(); } catch { return c.json({ error: 'invalid_request' }, 400); }
-  const { email, password } = body ?? {};
-  if (!email || !password) return c.json({ error: 'invalid_request', error_description: 'email + password gerekli' }, 400);
-  const user = await lookupUserByEmail(String(email));
-  if (!user) return c.json({ error: 'invalid_grant', error_description: 'Hesap bulunamadı' }, 400);
-  if (!user.active) return c.json({ error: 'invalid_grant', error_description: 'Hesap pasif' }, 403);
 
-  // 1. Lokal hash varsa ve argon2 ise → bizden verify
-  let ok = false;
-  if (user.password_hash && user.password_hash.startsWith('$argon2')) {
-    ok = await verifyPassword(String(password), user.password_hash);
-  }
+  // ---------- PASSWORD GRANT ----------
+  if (grant === 'password') {
+    const { email, password } = body ?? {};
+    if (!email || !password) return c.json({ error: 'invalid_request', error_description: 'email + password gerekli' }, 400);
+    const user = await lookupUserByEmail(String(email));
+    if (!user) return c.json({ error: 'invalid_grant', error_description: 'Hesap bulunamadı' }, 400);
+    if (!user.active) return c.json({ error: 'invalid_grant', error_description: 'Hesap pasif' }, 403);
 
-  // 2. Lokal başarısızsa veya hash yoksa → Supabase'e fallback (transparent migration)
-  if (!ok) {
-    const supaOk = await verifyAgainstLegacySupabase(String(email), String(password));
-    if (supaOk) {
-      // Supabase'de doğrulandı → bizim tarafta argon2 olarak kaydet
-      try {
-        await setUserPassword(user.id, String(password));
-        console.log(`[auth] Transparent migration: ${email} Supabase'den lokal'e taşındı`);
-      } catch (e) {
-        console.error(`[auth] Hash kaydetme hatası ${email}:`, (e as Error).message);
-      }
-      ok = true;
+    // Lokal Argon2 hash check (legacy Supabase fallback kaldırıldı — Faz 4)
+    let ok = false;
+    if (user.password_hash && user.password_hash.startsWith('$argon2')) {
+      ok = await verifyPassword(String(password), user.password_hash);
     }
+    if (!ok) return c.json({ error: 'invalid_grant', error_description: 'Şifre yanlış' }, 400);
+
+    const session = { id: user.id, email: user.email, role: user.role ?? 'authenticated', active: user.active };
+    const access_token = await issueAccessToken(session);
+    const refresh_token = await issueRefreshToken(session);
+    const rows = await sql`
+      SELECT u.id, u.email, u.created_at, p.role::text AS role, p.active, p.full_name
+      FROM auth.users u
+      LEFT JOIN public.profiles p ON p.id = u.id
+      WHERE u.id = ${user.id}
+    `;
+    return c.json({
+      access_token,
+      token_type: 'bearer',
+      expires_in: 3600,
+      expires_at: Math.floor(Date.now() / 1000) + 3600,
+      refresh_token,
+      user: rows[0] ? buildSupabaseUser(rows[0]) : { id: user.id, email: user.email },
+    });
   }
 
-  if (!ok) return c.json({ error: 'invalid_grant', error_description: 'Şifre yanlış' }, 400);
-  const session = { id: user.id, email: user.email, role: user.role ?? 'authenticated', active: user.active };
-  const access_token = await issueAccessToken(session);
-  const refresh_token = await issueRefreshToken(session);
-  // Profile'i + auth.users'u join et — full user object için
-  const rows = await sql`
-    SELECT u.id, u.email, u.created_at, p.role::text AS role, p.active, p.full_name
-    FROM auth.users u
-    LEFT JOIN public.profiles p ON p.id = u.id
-    WHERE u.id = ${user.id}
-  `;
-  return c.json({
-    access_token,
-    token_type: 'bearer',
-    expires_in: 3600,
-    expires_at: Math.floor(Date.now() / 1000) + 3600,
-    refresh_token,
-    user: rows[0] ? buildSupabaseUser(rows[0]) : { id: user.id, email: user.email },
-  });
+  // ---------- REFRESH TOKEN GRANT ----------
+  // Supabase JS client'ı access_token expiry'sine yaklaşırken otomatik çağırır.
+  // Backend bunu desteklemezse her ~1 saatte browser logout olur.
+  if (grant === 'refresh_token') {
+    const refreshTokenIn: string | undefined = body?.refresh_token;
+    if (!refreshTokenIn) {
+      return c.json({ error: 'invalid_request', error_description: 'refresh_token gerekli' }, 400);
+    }
+    let payload: { sub: string };
+    try {
+      payload = await verifyRefreshToken(refreshTokenIn);
+    } catch (e: any) {
+      return c.json({ error: 'invalid_grant', error_description: e?.message ?? 'Refresh token geçersiz' }, 400);
+    }
+    // User'ı tekrar fetch et — rolünü/aktiflik durumunu kontrol için (revoke desteği)
+    const rows = await sql`
+      SELECT u.id, u.email, u.created_at, p.role::text AS role, p.active, p.full_name
+      FROM auth.users u
+      LEFT JOIN public.profiles p ON p.id = u.id
+      WHERE u.id = ${payload.sub}
+      LIMIT 1
+    `;
+    const userRow = rows[0] as any;
+    if (!userRow) {
+      return c.json({ error: 'invalid_grant', error_description: 'Hesap bulunamadı' }, 400);
+    }
+    if (userRow.active === false) {
+      return c.json({ error: 'invalid_grant', error_description: 'Hesap pasif' }, 403);
+    }
+    const session = {
+      id: userRow.id,
+      email: userRow.email,
+      role: userRow.role ?? 'authenticated',
+      active: userRow.active !== false,
+    };
+    const access_token = await issueAccessToken(session);
+    // Rotating refresh — her refresh'te yeni token, eskisi (jwt stateless) doğal expire eder.
+    const refresh_token = await issueRefreshToken(session);
+    return c.json({
+      access_token,
+      token_type: 'bearer',
+      expires_in: 3600,
+      expires_at: Math.floor(Date.now() / 1000) + 3600,
+      refresh_token,
+      user: buildSupabaseUser(userRow),
+    });
+  }
+
+  return c.json({ error: 'unsupported_grant_type', error_description: `grant_type=${grant} desteklenmiyor` }, 400);
 });
 
 // POST /auth/v1/logout — frontend cookie temizler, biz no-op
-app.post('/auth/v1/logout', (c) => c.json({}, 204));
+app.post('/auth/v1/logout', (c) => c.body(null, 204));
 
 // GET /auth/v1/user — current user (Bearer token)
 function buildSupabaseUser(row: any) {
@@ -217,6 +269,12 @@ app.post('/rest/v1/rpc/:fn', async (c) => {
   try { body = await c.req.json(); } catch {}
   const params = body && typeof body === 'object' ? body : {};
   const argNames = Object.keys(params);
+  // Identifier injection guard — argNames double-quoted SQL identifier'a interpolated edilir.
+  for (const n of argNames) {
+    if (!RPC_RE.test(n)) {
+      return c.json({ message: `invalid rpc arg name: ${n}`, code: 'bad_request' }, 400);
+    }
+  }
   const argList = argNames.map((n, i) => `"${n}" => $${i + 1}`).join(', ');
   const sqlText = `SELECT public."${fn}"(${argList}) AS result`;
   const ctx = { userId: auth?.userId, role: auth?.role ?? 'anon', email: auth?.email, jwt: auth?.raw };
@@ -236,10 +294,70 @@ app.post('/rest/v1/rpc/:fn', async (c) => {
 // ─────────────────────────────────────────────────────────
 // /functions/v1/<name> — Edge function: gerçek + stublar
 // ─────────────────────────────────────────────────────────
-app.get('/functions/v1/', (c) => listFunctions(c));
+app.get('/functions/v1/', (c) => c.json({
+  ports: [
+    'email-send', 'email-inbound', 'email-webhook', 'reply-classify',
+    'iys-check', 'agency-panel',
+    'cron-tick-warmup', 'cron-recompute-scores', 'cron-overdue', 'cron-recurring',
+    'cron-daily-digest', 'daily-digest',
+    'wp-send', 'wp-webhook',
+    'gmail-oauth-callback', 'google-oauth-callback',
+    'google-calendar-pull', 'google-calendar-push', 'google-calendar-import', 'google-calendar-backfill',
+    'mail-metrics', 'mail-health', 'mail-events',
+  ],
+}));
 
 // Resend webhook — Resend Dashboard'da bu URL'ye event'ler düşer
 app.post('/functions/v1/email-webhook', (c) => handleResendWebhook(c));
+
+// Resend send — sales UI'ın ana send akışı (CampaignWizard, LeadEmailCompose, ReplyComposer)
+app.post('/functions/v1/email-send', (c) => handleEmailSend(c));
+
+// Unsubscribe — RFC 8058 one-click (POST, mail sağlayıcısı) + footer linki (GET, insan). Auth YOK (tokenli).
+app.get('/functions/v1/unsubscribe', (c) => handleUnsubscribe(c));
+app.post('/functions/v1/unsubscribe', (c) => handleUnsubscribe(c));
+
+// Resend inbound — DNS MX → Resend → POST. Reply'lerin otomatik thread'lenmesi için.
+app.post('/functions/v1/email-inbound', (c) => handleResendInbound(c));
+
+// Reply classify — inbound mesajı Claude Haiku 4.5 ile 6 kategoride sınıflandır
+app.post('/functions/v1/reply-classify', (c) => handleReplyClassify(c));
+
+// Reply draft — inbound yanıta Claude ile yanıt taslağı üret (human-in-the-loop, GÖNDERMEZ)
+app.post('/functions/v1/reply-draft', (c) => handleReplyDraft(c));
+
+// İYS check — opt-out registry kontrolü (stub mode + 30-gün cache)
+app.post('/functions/v1/iys-check', (c) => handleIysCheck(c));
+
+// Agency panel — token-bazlı public view (acente paneli)
+app.get('/functions/v1/agency-panel', (c) => handleAgencyPanel(c));
+app.post('/functions/v1/agency-panel', (c) => handleAgencyPanel(c));
+
+// Cron jobs (manuel tetikleme için endpoint, scheduler aynı zamanda otomatik çalıştırır)
+app.post('/functions/v1/cron-tick-warmup', (c) => handleWarmupTick(c));
+app.post('/functions/v1/cron-recompute-scores', (c) => handleRecomputeScores(c));
+app.post('/functions/v1/cron-overdue', async (c) => c.json(await (await import('./cron-scheduler.js')).runOverdueTick()));
+app.post('/functions/v1/cron-recurring', async (c) => c.json(await (await import('./cron-scheduler.js')).runRecurringTick()));
+app.post('/functions/v1/cron-daily-digest', (c) => handleCronDailyDigest(c));
+
+// Operations daily digest (TR 09:00) — Gmail OAuth ile system_email_credentials üzerinden gönderim
+app.post('/functions/v1/daily-digest', (c) => handleDailyDigest(c));
+
+// WhatsApp send (Meta Cloud API template) + inbound webhook (verify + quick-reply parser)
+app.post('/functions/v1/wp-send', (c) => handleWpSend(c));
+app.get('/functions/v1/wp-webhook', (c) => handleWpWebhook(c));
+app.post('/functions/v1/wp-webhook', (c) => handleWpWebhook(c));
+
+// Mail provider metrics (Resend / future adapter) — `Reports` sayfası için
+app.get('/functions/v1/mail-metrics', (c) => handleMailMetrics(c));
+app.post('/functions/v1/mail-metrics', (c) => handleMailMetrics(c));
+app.get('/functions/v1/mail-health', (c) => handleMailHealth(c));
+app.post('/functions/v1/mail-health', (c) => handleMailHealth(c));
+app.get('/functions/v1/mail-events', (c) => handleMailEvents(c));
+app.post('/functions/v1/mail-events', (c) => handleMailEvents(c));
+
+// Gmail OAuth callback — Google Calendar OAuth flow ile aynı handler, sadece alias
+app.get('/functions/v1/gmail-oauth-callback', (c) => handleGoogleOAuthCallback(c));
 
 // Google OAuth — init (frontend GET) + callback (Google redirect GET)
 app.get('/functions/v1/google-oauth-callback', (c) => handleGoogleOAuthCallback(c));
@@ -259,15 +377,22 @@ app.post('/functions/v1/email-test', async (c) => {
   return c.json(result, result.status === 'queued' ? 200 : 500);
 });
 
-// Geri kalan edge function'lar henüz stub
-app.all('/functions/v1/:fn', (c) => handleFunctionStub(c, c.req.param('fn')));
-app.all('/functions/v1/:fn/*', (c) => handleFunctionStub(c, c.req.param('fn')));
+// Bilinmeyen /functions/v1/<fn> → temiz 404
+app.all('/functions/v1/:fn', (c) => c.json({
+  error: 'function_not_found',
+  message: `'${c.req.param('fn')}' bu backend'de tanımlı değil. /functions/v1/ ile listeyi gör.`,
+}, 404));
+app.all('/functions/v1/:fn/*', (c) => c.json({
+  error: 'function_not_found',
+  message: `'${c.req.param('fn')}' bu backend'de tanımlı değil.`,
+}, 404));
 
-// ─────────────────────────────────────────────────────────
-// /storage/v1/* — Supabase Storage'a geçici reverse proxy
-// (Faz 2: lokal /var/www/storage'a indir + nginx'ten serv)
-// ─────────────────────────────────────────────────────────
-app.all('/storage/v1/*', (c) => handleStorageProxy(c));
+// /storage/v1/* — Artık nginx tarafından lokal /var/www/storage'tan serv ediliyor.
+// Hono'ya ulaşırsa demek ki nginx config bozulmuş, 410 Gone döndür ki sorun farkedilsin.
+app.all('/storage/v1/*', (c) => c.json({
+  error: 'storage_proxy_decommissioned',
+  message: 'nginx config kontrol et — /storage/v1/* lokal disk\'ten serv edilmeli',
+}, 410));
 
 // ─────────────────────────────────────────────────────────
 // 404 + error
@@ -283,10 +408,18 @@ serve({ fetch: app.fetch, port: PORT, hostname: '127.0.0.1' }, ({ port, address 
   console.log(`  Health: http://${address}:${port}/health`);
   console.log(`  REST  : http://${address}:${port}/rest/v1/<table>`);
   console.log(`  Auth  : http://${address}:${port}/auth/v1/token`);
+  // In-process campaign worker (5s delay → ilk tick)
+  startCampaignWorker();
+  // Cron scheduler (warmup-tick daily + recompute-scores 15dk)
+  startCronScheduler();
+  // Mailcow IMAP reply köprüsü (gated: MAILCOW_REPLY_POLLER_ENABLED)
+  startMailcowReplyPoller();
 });
 
 process.on('SIGTERM', async () => {
   console.log('SIGTERM, kapanıyor...');
+  stopCronScheduler();
+  stopCampaignWorker();
   await sql.end();
   process.exit(0);
 });

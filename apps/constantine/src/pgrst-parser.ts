@@ -58,9 +58,9 @@ function parseFilterValue(raw: string): { op: string; value: unknown; not?: bool
   const op = raw.slice(0, dotIdx);
   let value: unknown = raw.slice(dotIdx + 1);
   if (op === 'in' && typeof value === 'string') {
-    // "(a,b,c)" → ['a','b','c']
+    // "(a,b,c)" → ['a','b','c']; "()" → [] (boş in → FALSE WHERE)
     const inner = value.replace(/^\(|\)$/g, '');
-    value = inner.split(',').map((s) => decodeURIComponent(s.trim()));
+    value = inner ? inner.split(',').map((s) => decodeURIComponent(s.trim())) : [];
   } else if (op === 'is' && typeof value === 'string') {
     if (value === 'null') value = null;
     else if (value === 'true') value = true;
@@ -82,16 +82,73 @@ function parseFilterValue(raw: string): { op: string; value: unknown; not?: bool
 
 const RESERVED_KEYS = new Set(['select', 'order', 'limit', 'offset']);
 
+/** Parantez-aware comma split — embedded resource'ları parçalamaz.
+ *  "id,name,leads!inner(id,name)" → ["id", "name", "leads!inner(id,name)"]
+ */
+function splitTopLevel(input: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let buf = '';
+  for (const ch of input) {
+    if (ch === '(') depth++;
+    else if (ch === ')') depth--;
+    if (ch === ',' && depth === 0) {
+      if (buf.trim()) out.push(buf.trim());
+      buf = '';
+    } else {
+      buf += ch;
+    }
+  }
+  if (buf.trim()) out.push(buf.trim());
+  return out;
+}
+
+/** Embedded resource detector: "leads(id,name)" veya "leads!inner(id,name)"
+ *  PostgREST nested select; pgrst-parser şu an JOIN üretmiyor — outer select'ten atılır,
+ *  filter/order'da görünürse de bypass edilir (degraded mode). TODO: full implementation.
+ */
+const EMBED_RE = /^[a-zA-Z_][a-zA-Z0-9_]*(?:!(?:inner|left))?\s*\(/;
+function isEmbedded(col: string): boolean {
+  return EMBED_RE.test(col);
+}
+
+/** "email_messages.email_threads.lead_id" gibi nested filter path */
+function isNestedPath(col: string): boolean {
+  return col.includes('.');
+}
+
 export function parseQuery(url: URL): ParsedQuery {
   const sp = url.searchParams;
-  const select: string[] = (sp.get('select') ?? '*').split(',').map((s) => s.trim()).filter(Boolean);
+  const rawSelect = sp.get('select') ?? '*';
+  const allSelect = splitTopLevel(rawSelect);
+  const select: string[] = [];
+  for (const s of allSelect) {
+    if (isEmbedded(s)) {
+      // TODO: full embedded resource support (JOIN + nested response shape)
+      continue;
+    }
+    select.push(s);
+  }
+  if (select.length === 0) select.push('*');
+
   const orders: ParsedOrder[] = [];
   const orderRaw = sp.get('order');
   if (orderRaw) {
     for (const part of orderRaw.split(',')) {
-      const [column, ...rest] = part.split('.');
+      // JSONB path operatörü "." içermez, ama nested resource path içerir
+      // ("foo.bar.desc"). Split son token "asc"/"desc"/nullsfirst/nullslast.
+      const tokens = part.split('.');
+      const directionTokens = new Set(['asc', 'desc', 'nullsfirst', 'nullslast']);
+      let cutIdx = tokens.length;
+      while (cutIdx > 0 && directionTokens.has(tokens[cutIdx - 1]!)) cutIdx--;
+      const column = tokens.slice(0, cutIdx).join('.');
+      const rest = tokens.slice(cutIdx);
       const direction = rest.includes('desc') ? 'desc' : 'asc';
       const nullsFirst = rest.includes('nullsfirst') ? true : rest.includes('nullslast') ? false : undefined;
+      if (isNestedPath(column) && !column.match(/->>?|#>>?/)) {
+        // nested resource order (e.g. "leads.name") — degraded skip
+        continue;
+      }
       orders.push({ column, direction, nullsFirst });
     }
   }
@@ -101,6 +158,10 @@ export function parseQuery(url: URL): ParsedQuery {
   const filters: ParsedFilter[] = [];
   for (const [key, raw] of sp.entries()) {
     if (RESERVED_KEYS.has(key)) continue;
+    if (isNestedPath(key) && !key.match(/->>?|#>>?/)) {
+      // nested resource filter (e.g. "leads.name") — degraded skip
+      continue;
+    }
     const parsed = parseFilterValue(raw);
     filters.push({ column: key, ...parsed });
   }
@@ -108,18 +169,11 @@ export function parseQuery(url: URL): ParsedQuery {
   return { select, filters, orders, limit, offset };
 }
 
-/** ParsedQuery → SELECT SQL fragment (postgres-js sql helper'ı için string + params kullanılmaz, biz inline param tabanlı sql.unsafe yazacağız) */
-export function buildSelectSQL(
-  table: string,
-  pq: ParsedQuery,
-  params: unknown[],
-): { sqlText: string; params: unknown[] } {
-  const safeTable = identifier(table);
-  const safeSelect = pq.select.includes('*') ? '*' : pq.select.map(identifier).join(', ');
-  let where = '';
+/** Filter listesi → WHERE clause + params (mutates params).
+ *  Boş filter'da boş string döner (WHERE eklenmez). */
+function buildWhereClause(filters: ParsedFilter[], params: unknown[]): string {
   const wheres: string[] = [];
-
-  for (const f of pq.filters) {
+  for (const f of filters) {
     const col = identifier(f.column);
     let frag = '';
     switch (f.op) {
@@ -160,7 +214,18 @@ export function buildSelectSQL(
     if (f.not) frag = `NOT (${frag})`;
     wheres.push(frag);
   }
-  if (wheres.length) where = ` WHERE ${wheres.join(' AND ')}`;
+  return wheres.length ? ` WHERE ${wheres.join(' AND ')}` : '';
+}
+
+/** ParsedQuery → SELECT SQL fragment */
+export function buildSelectSQL(
+  table: string,
+  pq: ParsedQuery,
+  params: unknown[],
+): { sqlText: string; params: unknown[] } {
+  const safeTable = identifier(table);
+  const safeSelect = pq.select.includes('*') ? '*' : pq.select.map(identifier).join(', ');
+  const where = buildWhereClause(pq.filters, params);
 
   let orderBy = '';
   if (pq.orders.length) {
@@ -182,17 +247,17 @@ export function buildSelectSQL(
 }
 
 export function buildCountSQL(table: string, pq: ParsedQuery, params: unknown[]) {
-  const { sqlText } = buildSelectSQL(table, { ...pq, select: ['*'], orders: [], limit: undefined, offset: undefined }, params);
-  const countSql = sqlText.replace(/^SELECT \* FROM/, 'SELECT count(*)::bigint AS count FROM');
-  return { sqlText: countSql, params };
+  const safeTable = identifier(table);
+  const where = buildWhereClause(pq.filters, params);
+  return {
+    sqlText: `SELECT count(*)::bigint AS count FROM ${safeTable}${where}`,
+    params,
+  };
 }
 
 export function buildDeleteSQL(table: string, pq: ParsedQuery, params: unknown[]) {
   const safeTable = identifier(table);
-  const { sqlText } = buildSelectSQL(table, { ...pq, select: ['*'], orders: [], limit: undefined, offset: undefined }, params);
-  // WHERE kısmını al
-  const whereMatch = sqlText.match(/WHERE (.+)$/);
-  const where = whereMatch ? ` WHERE ${whereMatch[1]}` : '';
+  const where = buildWhereClause(pq.filters, params);
   if (!where) throw new Error('DELETE without WHERE refused');
   return { sqlText: `DELETE FROM ${safeTable}${where} RETURNING *`, params };
 }
@@ -209,9 +274,7 @@ export function buildPatchSQL(
     setFrags.push(`${identifier(k)} = $${params.push(v)}`);
   }
   if (!setFrags.length) throw new Error('Empty PATCH body');
-  const { sqlText } = buildSelectSQL(table, { ...pq, select: ['*'], orders: [], limit: undefined, offset: undefined }, params);
-  const whereMatch = sqlText.match(/WHERE (.+)$/);
-  const where = whereMatch ? ` WHERE ${whereMatch[1]}` : '';
+  const where = buildWhereClause(pq.filters, params);
   if (!where) throw new Error('PATCH without WHERE refused');
   return { sqlText: `UPDATE ${safeTable} SET ${setFrags.join(', ')}${where} RETURNING *`, params };
 }
@@ -245,8 +308,26 @@ export function buildInsertSQL(
   };
 }
 
-/** Postgres identifier (sınırlı validation — SQL injection'a karşı) */
+/** Postgres identifier (sınırlı validation — SQL injection'a karşı)
+ *  JSONB path operatörlerini de destekler:
+ *    metadata->>due_at      → "metadata"->>'due_at'   (text)
+ *    metadata->config       → "metadata"->'config'    (jsonb)
+ *    metadata#>>{a,b}       → "metadata"#>>'{a,b}'    (text path)
+ *    metadata#>{a,b}        → "metadata"#>'{a,b}'     (jsonb path)
+ */
 function identifier(name: string): string {
+  // JSONB single-key accessor: col->>key or col->key
+  const singleMatch = name.match(/^([a-zA-Z_][a-zA-Z0-9_]*)(->>|->)([a-zA-Z_][a-zA-Z0-9_]*)$/);
+  if (singleMatch) {
+    const [, col, op, key] = singleMatch;
+    return `"${col}"${op}'${key}'`;
+  }
+  // JSONB path accessor: col#>>{a,b,c} or col#>{a,b,c}
+  const pathMatch = name.match(/^([a-zA-Z_][a-zA-Z0-9_]*)(#>>|#>)(\{[a-zA-Z_0-9, -]+\})$/);
+  if (pathMatch) {
+    const [, col, op, path] = pathMatch;
+    return `"${col}"${op}'${path}'`;
+  }
   if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name)) {
     throw new Error(`Geçersiz identifier: ${name}`);
   }
