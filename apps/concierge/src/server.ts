@@ -1,7 +1,7 @@
 /**
- * @api/constantine — Constantine Yachts CRM backend
- * Port: 4001
- * DB: constantine (Postgres 16, localhost)
+ * @api/concierge — Concierge Connect backend
+ * Port: 4002
+ * DB: concierge (Postgres 16, localhost)
  *
  * Supabase drop-in replacement:
  *   /rest/v1/:table  → PostgREST uyumlu CRUD
@@ -20,7 +20,6 @@ import { authnMiddleware, requireAuth } from './middleware.js';
 import { handleRest } from './rest.js';
 import { handleFunctionStub, listFunctions } from './functions-stub.js';
 import { handleStorageProxy } from './storage-proxy.js';
-import { handleResendWebhook } from './email-webhook.js';
 import { handleGoogleOAuthCallback } from './google-oauth.js';
 import { handleCalendarPull, handleCalendarPush } from './google-calendar.js';
 import { sendTestEmail, sendEmail } from './resend-send.js';
@@ -487,9 +486,6 @@ app.post('/rest/v1/rpc/:fn', async (c) => {
 // ─────────────────────────────────────────────────────────
 app.get('/functions/v1/', (c) => listFunctions(c));
 
-// Resend webhook — Resend Dashboard'da bu URL'ye event'ler düşer
-app.post('/functions/v1/email-webhook', (c) => handleResendWebhook(c));
-
 // Google OAuth — init (frontend GET) + callback (Google redirect GET)
 app.get('/functions/v1/google-oauth-callback', (c) => handleGoogleOAuthCallback(c));
 app.post('/functions/v1/google-calendar-pull', (c) => handleCalendarPull(c));
@@ -526,7 +522,7 @@ app.onError((err, c) => {
 });
 
 serve({ fetch: app.fetch, port: PORT, hostname: '127.0.0.1' }, ({ port, address }) => {
-  console.log(`✓ @api/constantine ${address}:${port}'da dinliyor`);
+  console.log(`✓ @api/concierge ${address}:${port}'da dinliyor`);
   console.log(`  Health: http://${address}:${port}/health`);
   console.log(`  REST  : http://${address}:${port}/rest/v1/<table>`);
   console.log(`  Auth  : http://${address}:${port}/auth/v1/token`);

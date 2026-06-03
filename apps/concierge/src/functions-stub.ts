@@ -16,9 +16,6 @@ const FUNCTIONS: Record<string, FnInfo> = {
   'gmail-oauth-callback': { name: 'gmail-oauth-callback', description: 'Google OAuth dönüş URL\'si — kullanıcı hesabını profile\'a bağlar', status: 'stub' },
   'gmail-send':           { name: 'gmail-send',           description: 'Gmail API ile mail gönderir', status: 'stub' },
 
-  // Email (Resend)
-  'email-webhook':        { name: 'email-webhook',        description: 'Resend webhook — delivered/opened/clicked/bounced/complained', status: 'stub' },
-
   // WhatsApp (Meta)
   'wp-send':              { name: 'wp-send',              description: 'Meta WhatsApp Business API ile template mesaj gönder', status: 'stub' },
   'wp-webhook':           { name: 'wp-webhook',           description: 'WhatsApp inbound + button reply webhook', status: 'stub' },
