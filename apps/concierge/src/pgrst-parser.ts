@@ -90,6 +90,7 @@ export function parseQuery(url: URL): ParsedQuery {
   if (orderRaw) {
     for (const part of orderRaw.split(',')) {
       const [column, ...rest] = part.split('.');
+      if (!column) continue; // empty fragment guard
       const direction = rest.includes('desc') ? 'desc' : 'asc';
       const nullsFirst = rest.includes('nullsfirst') ? true : rest.includes('nullslast') ? false : undefined;
       orders.push({ column, direction, nullsFirst });

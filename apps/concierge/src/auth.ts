@@ -76,6 +76,18 @@ export async function issueRefreshToken(user: SessionUser): Promise<string> {
     .sign(ourSecret);
 }
 
+/** Refresh token verify — kendi secret + typ='refresh' enforce. Access token'la mix yok. */
+export async function verifyRefreshToken(token: string): Promise<{ sub: string }> {
+  const { payload } = await jwtVerify(token, ourSecret, { algorithms: ['HS256'] });
+  if (payload.typ !== 'refresh') {
+    throw new Error('Bu bir refresh token değil');
+  }
+  if (!payload.sub || typeof payload.sub !== 'string') {
+    throw new Error('Refresh token sub eksik');
+  }
+  return { sub: payload.sub };
+}
+
 export async function lookupUserByEmail(email: string): Promise<{ id: string; email: string; password_hash: string | null; role: string; active: boolean } | null> {
   const rows = await sql`
     SELECT u.id, u.email, u.password_hash, p.role::text AS role, p.active

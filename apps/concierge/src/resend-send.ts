@@ -66,14 +66,15 @@ export async function sendEmail(req: SendEmailRequest): Promise<{ id: string; st
 
     // email_messages tablosuna kaydet (eğer tablo varsa)
     // email_messages tablosu thread_id NOT NULL — thread yoksa transactional için skip et
-    if (req.threadId) {
+    const primaryTo = toArray[0];
+    if (req.threadId && primaryTo) {
       try {
         await sql`
           INSERT INTO email_messages (
             thread_id, direction, from_email, to_email, subject, body_html, body_text,
             resend_message_id, campaign_id, sent_at
           ) VALUES (
-            ${req.threadId}, 'outbound', ${fromAddr}, ${toArray[0]}, ${req.subject},
+            ${req.threadId}, 'outbound', ${fromAddr}, ${primaryTo}, ${req.subject},
             ${req.html ?? null}, ${req.text ?? null}, ${data.id},
             ${req.campaignId ?? null}, now()
           )

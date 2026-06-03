@@ -26,6 +26,7 @@ import { handleCalendarPull, handleCalendarPush } from './google-calendar.js';
 import { sendTestEmail, sendEmail } from './resend-send.js';
 import {
   verifyAnyJWT,
+  verifyRefreshToken,
   lookupUserByEmail,
   verifyPassword,
   issueAccessToken,
@@ -34,9 +35,16 @@ import {
   hashPassword,
   setUserPassword,
 } from './auth.js';
+import {
+  generateRecoveryToken,
+  consumeRecoveryToken,
+  sendRecoveryEmail,
+} from './auth-recovery.js';
 
 const PORT = Number(process.env.PORT ?? 4001);
 const CORS_ORIGINS = (process.env.CORS_ORIGINS ?? '*').split(',').map((s) => s.trim());
+const API_PUBLIC_URL = process.env.API_PUBLIC_URL || 'https://api-cc.constantineyachts.com';
+const SITE_URL_ADMIN = process.env.SITE_URL_ADMIN || 'https://cc-admin.constantineyachts.com';
 
 const app = new Hono();
 app.use('*', logger());
@@ -82,64 +90,255 @@ app.use('*', authnMiddleware);
 // Auth endpoints — Supabase /auth/v1/* compat
 // ─────────────────────────────────────────────────────────
 
-// POST /auth/v1/token?grant_type=password
+// POST /auth/v1/token?grant_type=(password|refresh_token)
 app.post('/auth/v1/token', async (c) => {
   const grant = c.req.query('grant_type');
-  if (grant !== 'password') {
-    return c.json({ error: 'unsupported_grant_type', error_description: `grant_type=${grant} desteklenmiyor` }, 400);
-  }
   let body: any;
   try { body = await c.req.json(); } catch { return c.json({ error: 'invalid_request' }, 400); }
-  const { email, password } = body ?? {};
-  if (!email || !password) return c.json({ error: 'invalid_request', error_description: 'email + password gerekli' }, 400);
-  const user = await lookupUserByEmail(String(email));
-  if (!user) return c.json({ error: 'invalid_grant', error_description: 'Hesap bulunamadı' }, 400);
-  if (!user.active) return c.json({ error: 'invalid_grant', error_description: 'Hesap pasif' }, 403);
 
-  // 1. Lokal hash varsa ve argon2 ise → bizden verify
-  let ok = false;
-  if (user.password_hash && user.password_hash.startsWith('$argon2')) {
-    ok = await verifyPassword(String(password), user.password_hash);
-  }
+  // ---------- PASSWORD GRANT ----------
+  if (grant === 'password') {
+    const { email, password } = body ?? {};
+    if (!email || !password) return c.json({ error: 'invalid_request', error_description: 'email + password gerekli' }, 400);
+    const user = await lookupUserByEmail(String(email));
+    if (!user) return c.json({ error: 'invalid_grant', error_description: 'Hesap bulunamadı' }, 400);
+    if (!user.active) return c.json({ error: 'invalid_grant', error_description: 'Hesap pasif' }, 403);
 
-  // 2. Lokal başarısızsa veya hash yoksa → Supabase'e fallback (transparent migration)
-  if (!ok) {
-    const supaOk = await verifyAgainstLegacySupabase(String(email), String(password));
-    if (supaOk) {
-      // Supabase'de doğrulandı → bizim tarafta argon2 olarak kaydet
-      try {
-        await setUserPassword(user.id, String(password));
-        console.log(`[auth] Transparent migration: ${email} Supabase'den lokal'e taşındı`);
-      } catch (e) {
-        console.error(`[auth] Hash kaydetme hatası ${email}:`, (e as Error).message);
-      }
-      ok = true;
+    // 1. Lokal hash varsa ve argon2 ise → bizden verify
+    let ok = false;
+    if (user.password_hash && user.password_hash.startsWith('$argon2')) {
+      ok = await verifyPassword(String(password), user.password_hash);
     }
+
+    // 2. Lokal başarısızsa veya hash yoksa → Supabase'e fallback (transparent migration)
+    if (!ok) {
+      const supaOk = await verifyAgainstLegacySupabase(String(email), String(password));
+      if (supaOk) {
+        try {
+          await setUserPassword(user.id, String(password));
+          console.log(`[auth] Transparent migration: ${email} Supabase'den lokal'e taşındı`);
+        } catch (e) {
+          console.error(`[auth] Hash kaydetme hatası ${email}:`, (e as Error).message);
+        }
+        ok = true;
+      }
+    }
+
+    if (!ok) return c.json({ error: 'invalid_grant', error_description: 'Şifre yanlış' }, 400);
+    const session = { id: user.id, email: user.email, role: user.role ?? 'authenticated', active: user.active };
+    const access_token = await issueAccessToken(session);
+    const refresh_token = await issueRefreshToken(session);
+    const rows = await sql`
+      SELECT u.id, u.email, u.created_at, p.role::text AS role, p.active, p.full_name
+      FROM auth.users u
+      LEFT JOIN public.profiles p ON p.id = u.id
+      WHERE u.id = ${user.id}
+    `;
+    return c.json({
+      access_token,
+      token_type: 'bearer',
+      expires_in: 3600,
+      expires_at: Math.floor(Date.now() / 1000) + 3600,
+      refresh_token,
+      user: rows[0] ? buildSupabaseUser(rows[0]) : { id: user.id, email: user.email },
+    });
   }
 
-  if (!ok) return c.json({ error: 'invalid_grant', error_description: 'Şifre yanlış' }, 400);
-  const session = { id: user.id, email: user.email, role: user.role ?? 'authenticated', active: user.active };
+  // ---------- REFRESH TOKEN GRANT ----------
+  // Supabase JS client 1 saatte bir otomatik çağırır. Yoksa browser logout olur.
+  if (grant === 'refresh_token') {
+    const refreshTokenIn: string | undefined = body?.refresh_token;
+    if (!refreshTokenIn) {
+      return c.json({ error: 'invalid_request', error_description: 'refresh_token gerekli' }, 400);
+    }
+    let payload: { sub: string };
+    try {
+      payload = await verifyRefreshToken(refreshTokenIn);
+    } catch (e: any) {
+      return c.json({ error: 'invalid_grant', error_description: e?.message ?? 'Refresh token geçersiz' }, 400);
+    }
+    // User re-fetch: rol/aktiflik değişmiş olabilir (silent revoke)
+    const rows = await sql`
+      SELECT u.id, u.email, u.created_at, p.role::text AS role, p.active, p.full_name
+      FROM auth.users u
+      LEFT JOIN public.profiles p ON p.id = u.id
+      WHERE u.id = ${payload.sub}
+      LIMIT 1
+    `;
+    const userRow = rows[0] as any;
+    if (!userRow) {
+      return c.json({ error: 'invalid_grant', error_description: 'Hesap bulunamadı' }, 400);
+    }
+    if (userRow.active === false) {
+      return c.json({ error: 'invalid_grant', error_description: 'Hesap pasif' }, 403);
+    }
+    const session = {
+      id: userRow.id,
+      email: userRow.email,
+      role: userRow.role ?? 'authenticated',
+      active: userRow.active !== false,
+    };
+    const access_token = await issueAccessToken(session);
+    const refresh_token = await issueRefreshToken(session); // rotating
+    return c.json({
+      access_token,
+      token_type: 'bearer',
+      expires_in: 3600,
+      expires_at: Math.floor(Date.now() / 1000) + 3600,
+      refresh_token,
+      user: buildSupabaseUser(userRow),
+    });
+  }
+
+  return c.json({ error: 'unsupported_grant_type', error_description: `grant_type=${grant} desteklenmiyor` }, 400);
+});
+
+// POST /auth/v1/logout — frontend cookie temizler, biz no-op
+app.post('/auth/v1/logout', (c) => c.body(null, 204));
+
+// POST /auth/v1/recover — şifre sıfırlama maili tetikle
+// Email enumeration koruması: kullanıcı bulunsa da bulunmasa da 200 dönüyoruz.
+app.post('/auth/v1/recover', async (c) => {
+  let body: any;
+  try { body = await c.req.json(); } catch { return c.json({}, 200); }
+  const email = body?.email;
+  if (!email || typeof email !== 'string') return c.json({}, 200);
+
+  try {
+    const user = await lookupUserByEmail(email);
+    if (user && user.active !== false) {
+      const token = await generateRecoveryToken(user.id);
+      const link =
+        `${API_PUBLIC_URL}/auth/v1/verify` +
+        `?token=${encodeURIComponent(token)}` +
+        `&type=recovery` +
+        `&redirect_to=${encodeURIComponent(`${SITE_URL_ADMIN}/reset-password`)}`;
+      const mail = await sendRecoveryEmail(user.email, link);
+      if (!mail.ok) {
+        // Sessiz log — kullanıcıya 200 dönmeye devam (enum koruması)
+        console.error('[recover] mail gönderilemedi', user.email, mail.error);
+      }
+    } else {
+      console.log(`[recover] bilinmeyen veya pasif email: ${email}`);
+    }
+  } catch (e: any) {
+    console.error('[recover] hata:', e.message);
+  }
+  return c.json({}, 200);
+});
+
+// GET /auth/v1/verify — recovery token doğrula + JWT mint + 302 redirect
+// Mail içindeki link buraya gelir. Hash fragment'ta access/refresh token'ları veririz,
+// Supabase JS client otomatik session restore eder.
+app.get('/auth/v1/verify', async (c) => {
+  const token = c.req.query('token');
+  const type = c.req.query('type') ?? 'recovery';
+  const redirectTo = c.req.query('redirect_to') || `${SITE_URL_ADMIN}/reset-password`;
+
+  if (!token) {
+    return c.redirect(`${redirectTo}?error=invalid_request`, 302);
+  }
+  const consumed = await consumeRecoveryToken(token);
+  if (!consumed) {
+    return c.redirect(`${redirectTo}?error=invalid_or_expired_token`, 302);
+  }
+
+  // Aktif user mu? (pasif hesap için login üretmeyiz)
+  const userRows = await sql`
+    SELECT u.id, u.email, p.role::text AS role, p.active
+    FROM auth.users u
+    LEFT JOIN public.profiles p ON p.id = u.id
+    WHERE u.id = ${consumed.userId}
+  `;
+  const row = userRows[0] as any;
+  if (!row || row.active === false) {
+    return c.redirect(`${redirectTo}?error=user_disabled`, 302);
+  }
+
+  const session = {
+    id: row.id,
+    email: row.email,
+    role: row.role ?? 'authenticated',
+    active: row.active ?? true,
+  };
   const access_token = await issueAccessToken(session);
   const refresh_token = await issueRefreshToken(session);
-  // Profile'i + auth.users'u join et — full user object için
+
+  // Supabase JS bekliyor: #access_token=...&refresh_token=...&type=recovery&token_type=bearer&expires_in=3600
+  const hash =
+    `access_token=${access_token}` +
+    `&refresh_token=${refresh_token}` +
+    `&expires_in=3600` +
+    `&token_type=bearer` +
+    `&type=${encodeURIComponent(type)}`;
+  return c.redirect(`${redirectTo}#${hash}`, 302);
+});
+
+// POST /auth/v1/signup — yeni hesap aç (vendor veya reseller self-service)
+app.post('/auth/v1/signup', async (c) => {
+  let body: any;
+  try { body = await c.req.json(); } catch { return c.json({ error: 'invalid_request' }, 400); }
+  const { email, password, options } = body ?? {};
+  if (!email || !password) return c.json({ error: 'invalid_request', error_description: 'email + password gerekli' }, 400);
+  if (String(password).length < 8) return c.json({ error: 'weak_password', error_description: 'Şifre en az 8 karakter olmalı' }, 400);
+
+  const fullName: string = options?.data?.full_name ?? '';
+  const accountType: string = options?.data?.account_type ?? 'vendor';
+  const role = accountType === 'reseller' ? 'reseller_admin' : 'vendor_owner';
+
+  // Mevcut user kontrolü
+  const existing = await lookupUserByEmail(String(email));
+  if (existing) {
+    return c.json({ error: 'user_already_exists', error_description: 'Bu email zaten kayıtlı' }, 400);
+  }
+
+  // 1. auth.users satırı oluştur (id auto-gen)
+  const hash = await hashPassword(String(password));
+  const inserted = await sql<{ id: string; created_at: string }[]>`
+    INSERT INTO auth.users (email, password_hash, encrypted_password, email_confirmed_at)
+    VALUES (${String(email).toLowerCase()}, ${hash}, '', now())
+    RETURNING id, created_at
+  `;
+  const insertedRow = inserted[0];
+  if (!insertedRow) {
+    return c.json({ error: 'signup_failed', error_description: 'User insert dönüş satırı boş' }, 500);
+  }
+  const userId = insertedRow.id;
+
+  // 2. public.profiles satırı oluştur (role enum cc_user_role)
+  try {
+    await sql`
+      INSERT INTO public.profiles (id, email, full_name, role)
+      VALUES (${userId}, ${String(email).toLowerCase()}, ${fullName}, ${role}::cc_user_role)
+    `;
+  } catch (e: any) {
+    // Profile insert fail → auth.users'ı temizle (atomic değil ama best effort)
+    await sql`DELETE FROM auth.users WHERE id = ${userId}`;
+    console.error('[signup] profile insert failed:', e.message);
+    return c.json({ error: 'signup_failed', error_description: e.message }, 400);
+  }
+
+  // 3. Session mint
+  const sessionUser = { id: userId, email: String(email).toLowerCase(), role: 'authenticated', active: true };
+  const access_token = await issueAccessToken(sessionUser);
+  const refresh_token = await issueRefreshToken(sessionUser);
+
   const rows = await sql`
     SELECT u.id, u.email, u.created_at, p.role::text AS role, p.active, p.full_name
     FROM auth.users u
     LEFT JOIN public.profiles p ON p.id = u.id
-    WHERE u.id = ${user.id}
+    WHERE u.id = ${userId}
   `;
+
   return c.json({
     access_token,
     token_type: 'bearer',
     expires_in: 3600,
     expires_at: Math.floor(Date.now() / 1000) + 3600,
     refresh_token,
-    user: rows[0] ? buildSupabaseUser(rows[0]) : { id: user.id, email: user.email },
+    user: rows[0] ? buildSupabaseUser(rows[0]) : { id: userId, email: String(email).toLowerCase() },
   });
 });
-
-// POST /auth/v1/logout — frontend cookie temizler, biz no-op
-app.post('/auth/v1/logout', (c) => c.json({}, 204));
 
 // GET /auth/v1/user — current user (Bearer token)
 function buildSupabaseUser(row: any) {
@@ -183,6 +382,56 @@ function buildSupabaseUser(row: any) {
 app.get('/auth/v1/user', async (c) => {
   const auth = requireAuth(c);
   if (!auth) return c.json({ message: 'Auth gerek', code: 'no_auth' }, 401);
+  const rows = await sql`
+    SELECT u.id, u.email, u.created_at, p.role::text AS role, p.active, p.full_name
+    FROM auth.users u
+    LEFT JOIN public.profiles p ON p.id = u.id
+    WHERE u.id = ${auth.userId}
+  `;
+  if (!rows[0]) return c.json({ message: 'User bulunamadı', code: 'not_found' }, 404);
+  return c.json(buildSupabaseUser(rows[0]));
+});
+
+// PUT /auth/v1/user — kendi şifre/email/metadata güncelleme
+// Supabase JS supabase.auth.updateUser({...}) bu endpoint'e PUT atar.
+app.put('/auth/v1/user', async (c) => {
+  const auth = requireAuth(c);
+  if (!auth) return c.json({ message: 'Auth gerek', code: 'no_auth' }, 401);
+
+  let body: any;
+  try { body = await c.req.json(); } catch { return c.json({ error: 'invalid_request' }, 400); }
+  const { password, email, data } = body ?? {};
+
+  if (password !== undefined) {
+    if (typeof password !== 'string' || password.length < 8) {
+      return c.json({ error: 'weak_password', error_description: 'Şifre en az 8 karakter olmalı' }, 400);
+    }
+    await setUserPassword(auth.userId, password);
+  }
+
+  if (email !== undefined && typeof email === 'string' && email.length > 0) {
+    const lower = email.toLowerCase();
+    // Başka kullanıcıda var mı kontrol
+    const dup = await sql`SELECT id FROM auth.users WHERE lower(email) = ${lower} AND id <> ${auth.userId} LIMIT 1`;
+    if (dup[0]) return c.json({ error: 'email_taken', error_description: 'Bu email başka bir hesapta kullanılıyor' }, 400);
+    await sql`UPDATE auth.users SET email = ${lower}, updated_at = now() WHERE id = ${auth.userId}`;
+    await sql`UPDATE public.profiles SET email = ${lower} WHERE id = ${auth.userId}`;
+  }
+
+  if (data !== undefined && typeof data === 'object' && data !== null) {
+    // full_name destekle (Supabase user_metadata.full_name pattern'i)
+    if (typeof (data as any).full_name === 'string') {
+      await sql`UPDATE public.profiles SET full_name = ${(data as any).full_name} WHERE id = ${auth.userId}`;
+    }
+    // raw_user_meta_data jsonb — destek için merge
+    await sql`
+      UPDATE auth.users
+      SET raw_user_meta_data = COALESCE(raw_user_meta_data, '{}'::jsonb) || ${sql.json(data)},
+          updated_at = now()
+      WHERE id = ${auth.userId}
+    `;
+  }
+
   const rows = await sql`
     SELECT u.id, u.email, u.created_at, p.role::text AS role, p.active, p.full_name
     FROM auth.users u

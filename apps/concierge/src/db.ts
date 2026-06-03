@@ -18,16 +18,17 @@ export const sql = postgres(DATABASE_URL, {
   },
 });
 
+type TxSql = postgres.TransactionSql<{ numeric: number; bigint: number }>;
+
 export async function withRequestContext<T>(
   ctx: { userId?: string; role?: string; email?: string; jwt?: string },
-  fn: (sql: typeof import('postgres').Sql) => Promise<T>,
+  fn: (sql: TxSql) => Promise<T>,
 ): Promise<T> {
   return sql.begin(async (tx) => {
-    // Postgres'in `current_setting('request.jwt.claim.sub')` ile auth.uid() döner
     if (ctx.userId) await tx`SELECT set_config('request.jwt.claim.sub', ${ctx.userId}, true)`;
     if (ctx.role) await tx`SELECT set_config('request.jwt.claim.role', ${ctx.role}, true)`;
     if (ctx.email) await tx`SELECT set_config('request.jwt.claim.email', ${ctx.email}, true)`;
     if (ctx.jwt) await tx`SELECT set_config('request.jwt.claims', ${ctx.jwt}, true)`;
-    return fn(tx as any);
-  });
+    return fn(tx);
+  }) as Promise<T>;
 }
