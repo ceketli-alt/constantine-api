@@ -23,6 +23,8 @@ import { handleStorageProxy } from './storage-proxy.js';
 import { handleGoogleOAuthCallback } from './google-oauth.js';
 import { handleCalendarPull, handleCalendarPush } from './google-calendar.js';
 import { sendTestEmail, sendEmail } from './resend-send.js';
+import { handleNotificationsDispatch, startNotificationsRunner } from './notifications-dispatch.js';
+import { handleStorefrontApi } from './storefront-api.js';
 import {
   verifyAnyJWT,
   verifyRefreshToken,
@@ -502,6 +504,12 @@ app.post('/functions/v1/email-test', async (c) => {
   return c.json(result, result.status === 'queued' ? 200 : 500);
 });
 
+// Storefront public API — catalog/product/availability/booking/voucher/reviews
+app.all('/functions/v1/storefront-api', (c) => handleStorefrontApi(c));
+
+// Notifications dispatcher — platform_admin manual trigger / retry ({ ids: [...] })
+app.post('/functions/v1/notifications-dispatch', (c) => handleNotificationsDispatch(c));
+
 // Geri kalan edge function'lar henüz stub
 app.all('/functions/v1/:fn', (c) => handleFunctionStub(c, c.req.param('fn')));
 app.all('/functions/v1/:fn/*', (c) => handleFunctionStub(c, c.req.param('fn')));
@@ -527,6 +535,9 @@ serve({ fetch: app.fetch, port: PORT, hostname: '127.0.0.1' }, ({ port, address 
   console.log(`  REST  : http://${address}:${port}/rest/v1/<table>`);
   console.log(`  Auth  : http://${address}:${port}/auth/v1/token`);
 });
+
+// In-process background workers (env-gated)
+startNotificationsRunner();
 
 process.on('SIGTERM', async () => {
   console.log('SIGTERM, kapanıyor...');

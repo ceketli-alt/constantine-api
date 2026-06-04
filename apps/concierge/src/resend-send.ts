@@ -7,8 +7,6 @@
  *   Authorization: Bearer re_<API_KEY>
  *   Body: { from, to, subject, html, text, reply_to, ... }
  */
-import { sql } from './db.js';
-
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const DEFAULT_SENDER_EMAIL = process.env.DEFAULT_SENDER_EMAIL || 'info@constantineyachts.com';
 const DEFAULT_SENDER_NAME = process.env.DEFAULT_SENDER_NAME || 'Constantine Yachts';
@@ -62,27 +60,6 @@ export async function sendEmail(req: SendEmailRequest): Promise<{ id: string; st
     if (!res.ok) {
       console.error('[resend] send failed:', data);
       return { id: '', status: 'failed', error: data?.message ?? `HTTP ${res.status}` };
-    }
-
-    // email_messages tablosuna kaydet (eğer tablo varsa)
-    // email_messages tablosu thread_id NOT NULL — thread yoksa transactional için skip et
-    const primaryTo = toArray[0];
-    if (req.threadId && primaryTo) {
-      try {
-        await sql`
-          INSERT INTO email_messages (
-            thread_id, direction, from_email, to_email, subject, body_html, body_text,
-            resend_message_id, campaign_id, sent_at
-          ) VALUES (
-            ${req.threadId}, 'outbound', ${fromAddr}, ${primaryTo}, ${req.subject},
-            ${req.html ?? null}, ${req.text ?? null}, ${data.id},
-            ${req.campaignId ?? null}, now()
-          )
-          ON CONFLICT DO NOTHING
-        `;
-      } catch (e: any) {
-        console.warn('[resend] email_messages insert skipped:', e.message);
-      }
     }
 
     return { id: data.id, status: 'queued' };
