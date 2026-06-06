@@ -66,6 +66,57 @@ describe('parseQuery', () => {
     const pq = parseQuery(u);
     expect(pq.filters).toEqual([]);
   });
+
+  // ---------------------------------------------------------------
+  // BUG FIX 2026-06-06 — `or=(...)` PostgREST syntax + double-decode
+  // (Leads sayfası "Şirket, kişi, email…" arama kutusu URI malformed
+  // hatasıyla 500 dönüyordu. Frontend ?or=(company_name.ilike.%jolly%,
+  // primary_contact_name.ilike.%jolly%,...) gönderiyor.)
+  // ---------------------------------------------------------------
+
+  it('or=(col.op.val,col.op.val) → orGroups[0] iki ParsedFilter ile', () => {
+    const u = url('/rest/v1/leads?or=(company_name.ilike.%25jolly%25,primary_contact_name.ilike.%25jolly%25)');
+    const pq = parseQuery(u);
+    expect(pq.filters).toEqual([]);
+    expect(pq.orGroups).toHaveLength(1);
+    expect(pq.orGroups[0]).toEqual([
+      { column: 'company_name', op: 'ilike', value: '%jolly%', not: false },
+      { column: 'primary_contact_name', op: 'ilike', value: '%jolly%', not: false },
+    ]);
+  });
+
+  it('or= boş parantez → orGroup boş, regresyon yok', () => {
+    const u = url('/rest/v1/leads?or=()');
+    const pq = parseQuery(u);
+    expect(pq.orGroups).toEqual([]);
+  });
+
+  it('or= top-level filter ile birlikte AND ile birleşir', () => {
+    const u = url('/rest/v1/leads?status=eq.new&or=(company_name.ilike.%25j%25,city.ilike.%25j%25)');
+    const pq = parseQuery(u);
+    expect(pq.filters).toEqual([{ column: 'status', op: 'eq', value: 'new', not: false }]);
+    expect(pq.orGroups[0]).toHaveLength(2);
+  });
+
+  it('ilike.%foo% (decoded %) → URIError yutulur, value raw kalır (double-decode bug fix)', () => {
+    // searchParams.get zaten decode etti: "%25foo%25" → "%foo%"
+    // İkinci decodeURIComponent("%foo%") URIError atardı; try/catch ile yutuldu.
+    const u = url('/rest/v1/leads?company_name=ilike.%25foo%25');
+    expect(() => parseQuery(u)).not.toThrow();
+    const pq = parseQuery(u);
+    expect(pq.filters[0]?.op).toBe('ilike');
+    expect(pq.filters[0]?.value).toBe('%foo%');
+  });
+
+  it('and=(...) → top-level filter listesine düz katılır', () => {
+    const u = url('/rest/v1/leads?and=(status.eq.new,score.gte.50)');
+    const pq = parseQuery(u);
+    expect(pq.filters).toEqual([
+      { column: 'status', op: 'eq', value: 'new', not: false },
+      { column: 'score', op: 'gte', value: '50', not: false },
+    ]);
+    expect(pq.orGroups).toEqual([]);
+  });
 });
 
 describe('buildSelectSQL', () => {
@@ -97,6 +148,25 @@ describe('buildSelectSQL', () => {
     pq.filters.push({ column: 'name"; DROP TABLE leads;--', op: 'eq', value: 'x' });
     const params: unknown[] = [];
     expect(() => buildSelectSQL('leads', pq, params)).toThrow(/Geçersiz identifier/);
+  });
+
+  // BUG FIX 2026-06-06: or=(...) → WHERE ... AND (a OR b)
+  it('or=(...) → WHERE includes parenthesized OR group with shared params', () => {
+    const pq = parseQuery(url('/rest/v1/leads?status=eq.new&or=(company_name.ilike.%25j%25,primary_contact_name.ilike.%25j%25)'));
+    const params: unknown[] = [];
+    const { sqlText } = buildSelectSQL('leads', pq, params);
+    expect(sqlText).toBe(
+      'SELECT * FROM "leads" WHERE "status" = $1 AND ("company_name" ILIKE $2 OR "primary_contact_name" ILIKE $3)',
+    );
+    expect(params).toEqual(['new', '%j%', '%j%']);
+  });
+
+  it('or=(...) tek elemanlı → parantez koyma, AND ile katıl', () => {
+    const pq = parseQuery(url('/rest/v1/leads?or=(company_name.ilike.%25j%25)'));
+    const params: unknown[] = [];
+    const { sqlText } = buildSelectSQL('leads', pq, params);
+    expect(sqlText).toBe('SELECT * FROM "leads" WHERE "company_name" ILIKE $1');
+    expect(params).toEqual(['%j%']);
   });
 });
 

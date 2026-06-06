@@ -34,6 +34,12 @@ export interface ParsedOrder {
 export interface ParsedQuery {
   select: string[];                  // ['*'] veya ['id', 'name', 'score']
   filters: ParsedFilter[];
+  /**
+   * PostgREST `or=(col1.op.val,col2.op.val,...)` syntax — her grup
+   * iç filter'ları OR ile birleştirir; gruplar arası ve top-level filter'larla
+   * arası AND. Birden fazla `or=` paramı verilirse her biri ayrı grup.
+   */
+  orGroups: ParsedFilter[][];
   orders: ParsedOrder[];
   limit?: number;
   offset?: number;
@@ -68,7 +74,14 @@ function parseFilterValue(raw: string): { op: string; value: unknown; not?: bool
   } else if ((op === 'like' || op === 'ilike') && typeof value === 'string') {
     value = value.replaceAll('*', '%');
   } else if (typeof value === 'string') {
-    value = decodeURIComponent(value);
+    // searchParams.get() zaten decode etti. Burada ikinci decode genelde no-op
+    // ama "%jolly%" gibi LIKE pattern'lerinde "%jo" URI-escape gibi okunup
+    // URIError: URI malformed atar. Güvenli yap — başarısızsa value as-is.
+    try {
+      value = decodeURIComponent(value);
+    } catch {
+      // Already-decoded value with literal %; keep raw
+    }
     // PostgREST behavior: eq/neq/gt/gte/lt/lte için 'true'/'false'/'null' literal'larını cast et
     // (Supabase JS .eq('active', true) → ?active=eq.true gönderir, biz boolean'a çevirmeli)
     if (op === 'eq' || op === 'neq' || op === 'gt' || op === 'gte' || op === 'lt' || op === 'lte') {
@@ -80,7 +93,41 @@ function parseFilterValue(raw: string): { op: string; value: unknown; not?: bool
   return { op, value, not };
 }
 
-const RESERVED_KEYS = new Set(['select', 'order', 'limit', 'offset']);
+const RESERVED_KEYS = new Set(['select', 'order', 'limit', 'offset', 'or', 'and']);
+
+/**
+ * Bir `or=(col.op.val,...)` veya `and=(...)` group'unun **iç bir filter'ını** parse eder.
+ *
+ * Örnek: `"company_name.ilike.%jolly%"` → `{ column: "company_name", op: "ilike", value: "%jolly%" }`
+ *
+ * NOT: Top-level `?col=op.val` syntax'ından farklı olarak burada column ve
+ * op.val arasında ayraç **ilk** nokta. Column içinde JSONB path (`metadata->>foo`)
+ * destekli — `->>`, `->`, `#>>`, `#>` sembolleri içinde nokta olmaz, güvenli.
+ */
+function parseSubFilter(sub: string): ParsedFilter {
+  let raw = sub;
+  let outerNot = false;
+  if (raw.startsWith('not.')) {
+    outerNot = true;
+    raw = raw.slice(4);
+  }
+  const dotIdx = raw.indexOf('.');
+  if (dotIdx === -1) {
+    throw new Error(`or/and grup içinde geçersiz sub-filter: ${sub}`);
+  }
+  const column = raw.slice(0, dotIdx);
+  const rest = raw.slice(dotIdx + 1);
+  const parsed = parseFilterValue(rest);
+  return { column, op: parsed.op, value: parsed.value, not: outerNot || parsed.not };
+}
+
+/** `or=(...)` veya `and=(...)` query parametresinin değerinden filter[] üretir. */
+function parseOrAndGroup(raw: string): ParsedFilter[] {
+  const trimmed = raw.replace(/^\(|\)$/g, '');
+  if (!trimmed) return [];
+  const parts = splitTopLevel(trimmed);
+  return parts.map(parseSubFilter);
+}
 
 /** Parantez-aware comma split — embedded resource'ları parçalamaz.
  *  "id,name,leads!inner(id,name)" → ["id", "name", "leads!inner(id,name)"]
@@ -156,7 +203,21 @@ export function parseQuery(url: URL): ParsedQuery {
   const offset = sp.get('offset') ? Number(sp.get('offset')) : undefined;
 
   const filters: ParsedFilter[] = [];
+  const orGroups: ParsedFilter[][] = [];
   for (const [key, raw] of sp.entries()) {
+    if (key === 'or') {
+      // PostgREST: ?or=(col1.op.val,col2.op.val,...) — N tane OR'lu grup
+      const group = parseOrAndGroup(raw);
+      if (group.length) orGroups.push(group);
+      continue;
+    }
+    if (key === 'and') {
+      // PostgREST: ?and=(col1.op.val,col2.op.val,...) — N tane AND'li grup
+      // Sub-filter'ları top-level filter'lara düz katarız (AND zaten default join).
+      const group = parseOrAndGroup(raw);
+      for (const f of group) filters.push(f);
+      continue;
+    }
     if (RESERVED_KEYS.has(key)) continue;
     if (isNestedPath(key) && !key.match(/->>?|#>>?/)) {
       // nested resource filter (e.g. "leads.name") — degraded skip
@@ -166,53 +227,71 @@ export function parseQuery(url: URL): ParsedQuery {
     filters.push({ column: key, ...parsed });
   }
 
-  return { select, filters, orders, limit, offset };
+  return { select, filters, orGroups, orders, limit, offset };
 }
 
-/** Filter listesi → WHERE clause + params (mutates params).
- *  Boş filter'da boş string döner (WHERE eklenmez). */
-function buildWhereClause(filters: ParsedFilter[], params: unknown[]): string {
+/** Tek bir ParsedFilter → SQL fragment (params side-effect). */
+function buildSingleFilter(f: ParsedFilter, params: unknown[]): string {
+  const col = identifier(f.column);
+  let frag = '';
+  switch (f.op) {
+    case 'eq': frag = `${col} = $${params.push(f.value)}`; break;
+    case 'neq': frag = `${col} <> $${params.push(f.value)}`; break;
+    case 'gt': frag = `${col} > $${params.push(f.value)}`; break;
+    case 'gte': frag = `${col} >= $${params.push(f.value)}`; break;
+    case 'lt': frag = `${col} < $${params.push(f.value)}`; break;
+    case 'lte': frag = `${col} <= $${params.push(f.value)}`; break;
+    case 'like': frag = `${col} LIKE $${params.push(f.value)}`; break;
+    case 'ilike': frag = `${col} ILIKE $${params.push(f.value)}`; break;
+    case 'is':
+      if (f.value === null) frag = `${col} IS NULL`;
+      else frag = `${col} IS ${f.value}`;
+      break;
+    case 'in':
+      if (Array.isArray(f.value)) {
+        if (f.value.length === 0) { frag = 'FALSE'; break; }
+        const placeholders = f.value.map((v) => `$${params.push(v)}`).join(', ');
+        frag = `${col} IN (${placeholders})`;
+      } else {
+        frag = `${col} IN ($${params.push(f.value)})`;
+      }
+      break;
+    case 'cs':  // contains (jsonb @> / array @>)
+      frag = `${col} @> $${params.push(typeof f.value === 'string' ? JSON.parse(f.value) : f.value)}`;
+      break;
+    case 'cd':  // contained
+      frag = `${col} <@ $${params.push(typeof f.value === 'string' ? JSON.parse(f.value) : f.value)}`;
+      break;
+    case 'fts':
+      frag = `to_tsvector('simple', ${col}) @@ plainto_tsquery('simple', $${params.push(f.value)})`;
+      break;
+    default:
+      // Bilinmeyen op'lar 422 hatası yerine eşitlik gibi davransın (defensive)
+      frag = `${col} = $${params.push(f.value)}`;
+  }
+  if (f.not) frag = `NOT (${frag})`;
+  return frag;
+}
+
+/** Filter listesi + OR grupları → WHERE clause + params (mutates params).
+ *  Boş filter+orGroups'ta boş string döner (WHERE eklenmez).
+ *
+ *  Top-level filter'lar ve her OR grup AND ile birleşir; grup içindeki sub-filter'lar OR.
+ *    filters=[a,b], orGroups=[[c,d]] → WHERE a AND b AND (c OR d)
+ */
+function buildWhereClause(
+  filters: ParsedFilter[],
+  orGroups: ParsedFilter[][],
+  params: unknown[],
+): string {
   const wheres: string[] = [];
   for (const f of filters) {
-    const col = identifier(f.column);
-    let frag = '';
-    switch (f.op) {
-      case 'eq': frag = `${col} = $${params.push(f.value)}`; break;
-      case 'neq': frag = `${col} <> $${params.push(f.value)}`; break;
-      case 'gt': frag = `${col} > $${params.push(f.value)}`; break;
-      case 'gte': frag = `${col} >= $${params.push(f.value)}`; break;
-      case 'lt': frag = `${col} < $${params.push(f.value)}`; break;
-      case 'lte': frag = `${col} <= $${params.push(f.value)}`; break;
-      case 'like': frag = `${col} LIKE $${params.push(f.value)}`; break;
-      case 'ilike': frag = `${col} ILIKE $${params.push(f.value)}`; break;
-      case 'is':
-        if (f.value === null) frag = `${col} IS NULL`;
-        else frag = `${col} IS ${f.value}`;
-        break;
-      case 'in':
-        if (Array.isArray(f.value)) {
-          if (f.value.length === 0) { frag = 'FALSE'; break; }
-          const placeholders = f.value.map((v) => `$${params.push(v)}`).join(', ');
-          frag = `${col} IN (${placeholders})`;
-        } else {
-          frag = `${col} IN ($${params.push(f.value)})`;
-        }
-        break;
-      case 'cs':  // contains (jsonb @> / array @>)
-        frag = `${col} @> $${params.push(typeof f.value === 'string' ? JSON.parse(f.value) : f.value)}`;
-        break;
-      case 'cd':  // contained
-        frag = `${col} <@ $${params.push(typeof f.value === 'string' ? JSON.parse(f.value) : f.value)}`;
-        break;
-      case 'fts':
-        frag = `to_tsvector('simple', ${col}) @@ plainto_tsquery('simple', $${params.push(f.value)})`;
-        break;
-      default:
-        // Bilinmeyen op'lar 422 hatası yerine eşitlik gibi davransın (defensive)
-        frag = `${col} = $${params.push(f.value)}`;
-    }
-    if (f.not) frag = `NOT (${frag})`;
-    wheres.push(frag);
+    wheres.push(buildSingleFilter(f, params));
+  }
+  for (const group of orGroups) {
+    if (group.length === 0) continue;
+    const subs = group.map((f) => buildSingleFilter(f, params));
+    wheres.push(subs.length === 1 ? subs[0]! : `(${subs.join(' OR ')})`);
   }
   return wheres.length ? ` WHERE ${wheres.join(' AND ')}` : '';
 }
@@ -225,7 +304,7 @@ export function buildSelectSQL(
 ): { sqlText: string; params: unknown[] } {
   const safeTable = identifier(table);
   const safeSelect = pq.select.includes('*') ? '*' : pq.select.map(identifier).join(', ');
-  const where = buildWhereClause(pq.filters, params);
+  const where = buildWhereClause(pq.filters, pq.orGroups ?? [], params);
 
   let orderBy = '';
   if (pq.orders.length) {
@@ -248,7 +327,7 @@ export function buildSelectSQL(
 
 export function buildCountSQL(table: string, pq: ParsedQuery, params: unknown[]) {
   const safeTable = identifier(table);
-  const where = buildWhereClause(pq.filters, params);
+  const where = buildWhereClause(pq.filters, pq.orGroups ?? [], params);
   return {
     sqlText: `SELECT count(*)::bigint AS count FROM ${safeTable}${where}`,
     params,
@@ -257,7 +336,7 @@ export function buildCountSQL(table: string, pq: ParsedQuery, params: unknown[])
 
 export function buildDeleteSQL(table: string, pq: ParsedQuery, params: unknown[]) {
   const safeTable = identifier(table);
-  const where = buildWhereClause(pq.filters, params);
+  const where = buildWhereClause(pq.filters, pq.orGroups ?? [], params);
   if (!where) throw new Error('DELETE without WHERE refused');
   return { sqlText: `DELETE FROM ${safeTable}${where} RETURNING *`, params };
 }
@@ -274,7 +353,7 @@ export function buildPatchSQL(
     setFrags.push(`${identifier(k)} = $${params.push(v)}`);
   }
   if (!setFrags.length) throw new Error('Empty PATCH body');
-  const where = buildWhereClause(pq.filters, params);
+  const where = buildWhereClause(pq.filters, pq.orGroups ?? [], params);
   if (!where) throw new Error('PATCH without WHERE refused');
   return { sqlText: `UPDATE ${safeTable} SET ${setFrags.join(', ')}${where} RETURNING *`, params };
 }
