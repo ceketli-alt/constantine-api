@@ -32,8 +32,10 @@ interface AgencyContext {
 
 async function validateAgencyToken(token: string | null): Promise<AgencyContext | null> {
   if (!token || typeof token !== 'string') return null;
-  if (token.length < 30 || token.length > 36) return null;
-  if (!/^[A-Za-z0-9_-]+$/.test(token)) return null;
+  // Accept: full 30-36 char hash tokens OR short alphabetic slugs (e.g. "genel")
+  const isHash = token.length >= 30 && token.length <= 36 && /^[A-Za-z0-9_-]+$/.test(token);
+  const isSlug = token.length >= 3 && token.length <= 20 && /^[a-z0-9-]+$/.test(token);
+  if (!isHash && !isSlug) return null;
 
   const rows = await sql`
     SELECT t.id AS token_id, t.token, t.expires_at,
@@ -41,7 +43,7 @@ async function validateAgencyToken(token: string | null): Promise<AgencyContext 
            a.contact_name, a.phone
     FROM agency_tokens t
     INNER JOIN agencies a ON a.id = t.agency_id
-    WHERE t.token = ${token}
+    WHERE (t.token = ${token} OR t.slug = ${token})
       AND t.active = true
       AND a.active = true
     LIMIT 1
@@ -211,6 +213,8 @@ interface RequestBody {
   start_time?: unknown;
   duration_hours?: unknown;
   guest_count?: unknown;
+  contact_name?: unknown;
+  contact_info?: unknown;
   guest_name?: unknown;
   notes?: unknown;
 }
@@ -249,6 +253,14 @@ async function handleRequest(ctx: AgencyContext, body: unknown) {
   if (!Number.isInteger(guests) || guests < 1) {
     return { status: 400, body: { error: 'guest_count must be positive integer' } };
   }
+  const contactName = typeof b.contact_name === 'string' ? b.contact_name.trim().slice(0, 200) : null;
+  if (!contactName) {
+    return { status: 400, body: { error: 'contact_name is required' } };
+  }
+  const contactInfo = typeof b.contact_info === 'string' ? b.contact_info.trim().slice(0, 200) : null;
+  if (!contactInfo) {
+    return { status: 400, body: { error: 'contact_info is required' } };
+  }
   const guestName = typeof b.guest_name === 'string' ? b.guest_name.trim().slice(0, 200) : null;
   const notes = typeof b.notes === 'string' ? b.notes.trim().slice(0, 1000) : null;
 
@@ -269,11 +281,11 @@ async function handleRequest(ctx: AgencyContext, body: unknown) {
   const insertRows = await sql`
     INSERT INTO agency_requests (
       agency_id, token_id, boat_id, date, start_time,
-      duration_hours, guest_count, guest_name, notes
+      duration_hours, guest_count, contact_name, contact_info, guest_name, notes
     ) VALUES (
       ${ctx.agency.id}::uuid, ${ctx.token.id}::uuid, ${b.boat_id}::uuid,
       ${b.date}::date, ${startTime}::time,
-      ${dur}, ${guests}, ${guestName}, ${notes}
+      ${dur}, ${guests}, ${contactName}, ${contactInfo}, ${guestName}, ${notes}
     )
     RETURNING id
   `;
