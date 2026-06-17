@@ -5,6 +5,8 @@
  *   GET  ?action=boats                                  → aktif tekne listesi
  *   GET  ?action=boat-detail&boat_id=<>                 → tek tekne + galeri
  *   GET  ?action=availability&boat_id=<>&from=<>&to=<>  → busy_blocks (rezervasyonlar)
+ *   GET  ?action=search&date=<>&start_time=<>&duration_hours=<>  → uygun tekneler (exact/near/none)
+ *   POST ?action=concierge   { q, lang, today }         → doğal dil arama (Haiku parse → search → narrate)
  *   POST ?action=request                                → rezervasyon isteği yarat
  *
  * Auth: ?token=<32-char URL-safe>. Hiçbir kullanıcı login yok.
@@ -12,6 +14,12 @@
  */
 import type { Context } from 'hono';
 import { sql } from './db.js';
+import { sendEmail } from './resend-send.js';
+import {
+  conciergeConfigured,
+  parseConciergeQuery,
+  narrateConciergeResults,
+} from './agency-concierge.js';
 
 // ============================================================
 // Token validation
@@ -84,10 +92,6 @@ function minutesToHHMM(mins: number): string {
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
 }
 
-function addHours(timeStr: string, hours: number): string {
-  return minutesToHHMM(timeToMinutes(timeStr) + Math.round(hours * 60));
-}
-
 function endMinutesUnwrapped(timeStr: string, hours: number): number {
   return timeToMinutes(timeStr) + Math.round(hours * 60);
 }
@@ -96,17 +100,57 @@ function rangesOverlapMinutes(aStart: number, aEnd: number, bStart: number, bEnd
   return aStart < bEnd && bStart < aEnd;
 }
 
+// Sıralı + çakışan/bitişik blokları birleştir (handleAvailability + handleSearch ortak).
+function mergeRanges(blocks: Array<{ s: number; e: number }>): Array<{ s: number; e: number }> {
+  const sorted = [...blocks].sort((a, b) => a.s - b.s);
+  const merged: Array<{ s: number; e: number }> = [];
+  for (const blk of sorted) {
+    const last = merged[merged.length - 1];
+    if (last && blk.s <= last.e) last.e = Math.max(last.e, blk.e);
+    else merged.push({ ...blk });
+  }
+  return merged;
+}
+
+// [dayStart, dayEnd] içinde dolu (merged, sıralı non-overlap) blokların tümleyeni = boş pencereler.
+function computeFreeWindows(
+  merged: Array<{ s: number; e: number }>,
+  dayStart: number,
+  dayEnd: number,
+): Array<{ s: number; e: number }> {
+  const free: Array<{ s: number; e: number }> = [];
+  let cursor = dayStart;
+  for (const b of merged) {
+    if (b.e <= dayStart) continue;
+    if (b.s >= dayEnd) break;
+    const bs = Math.max(b.s, dayStart);
+    if (bs > cursor) free.push({ s: cursor, e: bs });
+    cursor = Math.max(cursor, Math.min(b.e, dayEnd));
+    if (cursor >= dayEnd) break;
+  }
+  if (cursor < dayEnd) free.push({ s: cursor, e: dayEnd });
+  return free;
+}
+
 // ============================================================
 // Handlers
 // ============================================================
 
 async function handleBoats(ctx: AgencyContext) {
+  // min_price: en düşük aktif fiyat satırı (kartta "€X'den başlayan").
+  // White-label: owner/agency_only alanları acenteye DÖNMEZ.
   const data = await sql`
-    SELECT id, name, image_url, capacity, short_description,
-           short_description_translations, default_duration_hours
-    FROM boats
-    WHERE active = true
-    ORDER BY name
+    SELECT b.id, b.name, b.image_url, b.capacity, b.short_description,
+           b.short_description_translations, b.default_duration_hours,
+           p.price AS min_price, p.currency AS min_price_currency
+    FROM boats b
+    LEFT JOIN LATERAL (
+      SELECT price, currency FROM boat_pricing_rows
+      WHERE boat_id = b.id AND active = true
+      ORDER BY price ASC LIMIT 1
+    ) p ON true
+    WHERE b.active = true
+    ORDER BY b.search_priority DESC, b.created_at ASC NULLS LAST, b.name
   `;
   return { boats: data, agency: { name: ctx.agency.name } };
 }
@@ -130,6 +174,12 @@ async function handleBoatDetail(boatId: string) {
     WHERE boat_id = ${boatId}
     ORDER BY sort_order ASC
   `;
+  const pricing = await sql`
+    SELECT id, label, label_translations, duration_hours, price, currency, unit
+    FROM boat_pricing_rows
+    WHERE boat_id = ${boatId} AND active = true
+    ORDER BY sort_order ASC, price ASC
+  `;
   return {
     status: 200,
     body: {
@@ -142,6 +192,7 @@ async function handleBoatDetail(boatId: string) {
         short_description_translations: boat.short_description_translations ?? {},
         default_duration_hours: boat.default_duration_hours,
         photos,
+        pricing: pricing.map((p: any) => ({ ...p, label_translations: p.label_translations ?? {} })),
       },
     },
   };
@@ -179,32 +230,288 @@ async function handleAvailability(boatId: string, fromStr: string, toStr: string
       AND status != 'cancelled'
   `;
 
-  const byDate: Record<string, Array<{ start_time: string; end_time: string }>> = {};
+  // Dakika-bazlı bloklar (unwrapped — gece yarısını aşan tur >1440 olabilir,
+  // çıkışta minutesToHHMM wrap'ler; mevcut response shape korunur).
+  const byDate: Record<string, Array<{ s: number; e: number }>> = {};
   for (const b of bookings) {
     if (!b.date) continue;
     const dateKey = String(b.date).slice(0, 10);
-    let start: string;
-    let end: string;
+    let s: number;
+    let e: number;
     if (b.start_time) {
-      start = String(b.start_time).slice(0, 5);
-      const dur = Number(b.duration_hours) || 4;
-      end = addHours(start, dur);
+      s = timeToMinutes(String(b.start_time).slice(0, 5));
+      e = s + Math.round((Number(b.duration_hours) || 4) * 60);
     } else {
-      start = '00:00';
-      end = '23:59';
+      s = 0;
+      e = 1439;
     }
-    if (!byDate[dateKey]) byDate[dateKey] = [];
-    byDate[dateKey].push({ start_time: start, end_time: end });
+    (byDate[dateKey] ??= []).push({ s, e });
   }
 
+  // Partner tekneler: Google freeBusy'den senkronlanan dolu saatler (boat_busy_slots cache)
+  const slots = await sql`
+    SELECT date::text AS date, start_time::text AS start_time, end_time::text AS end_time
+    FROM boat_busy_slots
+    WHERE boat_id = ${boatId}
+      AND date >= ${fromStr}::date
+      AND date <= ${toStr}::date
+  `;
+  for (const sRow of slots) {
+    const dateKey = String(sRow.date).slice(0, 10);
+    const s = timeToMinutes(String(sRow.start_time).slice(0, 5));
+    let e = timeToMinutes(String(sRow.end_time).slice(0, 5));
+    if (e <= s) e = 1439; // defensive — sync'in midnight-split konvansiyonu bunu üretmez
+    (byDate[dateKey] ??= []).push({ s, e });
+  }
+
+  // Tarih başına sırala + çakışan/bitişik blokları birleştir
   const availability = Object.keys(byDate)
     .sort()
-    .map((date) => ({
-      date,
-      busy_blocks: byDate[date]!.sort((x, y) => x.start_time.localeCompare(y.start_time)),
-    }));
+    .map((date) => {
+      const merged = mergeRanges(byDate[date]!);
+      return {
+        date,
+        busy_blocks: merged.map((m) => ({ start_time: minutesToHHMM(m.s), end_time: minutesToHHMM(m.e) })),
+      };
+    });
 
   return { status: 200, body: { availability } };
+}
+
+// ============================================================
+// Hızlı arama — tüm filodan tarih+saat+süreye uygun tekneler (v3.2)
+// ============================================================
+// Kapasite filtresi YOK (her tekne çıkar). Müsaitlik deterministik: o tarihin
+// bookings ∪ boat_busy_slots → boş pencereler → exact/near/none. Sıralama:
+// exact → near → none, her grupta search_priority DESC (CONSTANTINE öne çıkar).
+const SEARCH_DAY_START = 360; // 06:00
+const SEARCH_DAY_END = 1440; // 24:00
+
+async function handleSearch(date: string, startTime: string, durationStr: string) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return { status: 400, body: { error: 'invalid date (YYYY-MM-DD)' } };
+  }
+  const reqDate = new Date(date + 'T00:00:00Z');
+  const today = new Date();
+  today.setUTCHours(0, 0, 0, 0);
+  if (isNaN(reqDate.getTime()) || reqDate.getTime() < today.getTime()) {
+    return { status: 400, body: { error: 'date in past' } };
+  }
+  if ((reqDate.getTime() - today.getTime()) / 86400000 > 60) {
+    return { status: 400, body: { error: 'date too far (max 60 days)' } };
+  }
+  if (!/^\d{2}:\d{2}$/.test(startTime)) {
+    return { status: 400, body: { error: 'invalid start_time (HH:MM)' } };
+  }
+  const startH = Number(startTime.split(':')[0]);
+  if (startH < 6 || startH > 23) {
+    return { status: 400, body: { error: 'start_time must be 06:00-23:00' } };
+  }
+  const dur = Number(durationStr);
+  if (!Number.isFinite(dur) || dur < 0.5 || dur > 12) {
+    return { status: 400, body: { error: 'duration_hours must be 0.5-12' } };
+  }
+
+  const reqStart = timeToMinutes(startTime);
+  const durM = Math.round(dur * 60);
+  const reqEnd = reqStart + durM;
+
+  // A: tüm aktif tekneler + min fiyat + öncelik (kapasite filtresi YOK; white-label alanlar dönmez)
+  const boats = await sql`
+    SELECT b.id, b.name, b.image_url, b.capacity, b.short_description,
+           b.short_description_translations, b.default_duration_hours, b.search_priority,
+           p.price AS min_price, p.currency AS min_price_currency
+    FROM boats b
+    LEFT JOIN LATERAL (
+      SELECT price, currency FROM boat_pricing_rows
+      WHERE boat_id = b.id AND active = true
+      ORDER BY price ASC LIMIT 1
+    ) p ON true
+    WHERE b.active = true
+  `;
+
+  // B+C: o tarihin dolu kaynakları (tüm tekneler tek sorguda — tekne-başı döngü yok)
+  const bookings = await sql`
+    SELECT boat_id, start_time::text AS start_time, duration_hours
+    FROM bookings
+    WHERE date = ${date}::date AND status != 'cancelled'
+  `;
+  const slots = await sql`
+    SELECT boat_id, start_time::text AS start_time, end_time::text AS end_time
+    FROM boat_busy_slots
+    WHERE date = ${date}::date
+  `;
+
+  const byBoat: Record<string, Array<{ s: number; e: number }>> = {};
+  for (const b of bookings) {
+    let s: number;
+    let e: number;
+    if (b.start_time) {
+      s = timeToMinutes(String(b.start_time).slice(0, 5));
+      e = s + Math.round((Number(b.duration_hours) || 4) * 60);
+    } else {
+      s = 0;
+      e = 1439;
+    }
+    (byBoat[b.boat_id] ??= []).push({ s, e });
+  }
+  for (const sRow of slots) {
+    const s = timeToMinutes(String(sRow.start_time).slice(0, 5));
+    let e = timeToMinutes(String(sRow.end_time).slice(0, 5));
+    if (e <= s) e = 1439;
+    (byBoat[sRow.boat_id] ??= []).push({ s, e });
+  }
+
+  const enriched = boats.map((boat: any) => {
+    const merged = mergeRanges(byBoat[boat.id] ?? []);
+    const free = computeFreeWindows(merged, SEARCH_DAY_START, SEARCH_DAY_END);
+    const exact = free.some((w) => w.s <= reqStart && reqEnd <= w.e);
+    let match: 'exact' | 'near' | 'none' = 'none';
+    let suggested_start: string | null = null;
+    let suggested_end: string | null = null;
+    if (exact) {
+      match = 'exact';
+    } else {
+      const fit = free.filter((w) => w.e - w.s >= durM);
+      if (fit.length > 0) {
+        let bestStart = -1;
+        let bestDist = Infinity;
+        for (const w of fit) {
+          const slotStart = Math.max(w.s, Math.min(reqStart, w.e - durM));
+          const d = Math.abs(slotStart - reqStart);
+          if (d < bestDist) {
+            bestDist = d;
+            bestStart = slotStart;
+          }
+        }
+        match = 'near';
+        suggested_start = minutesToHHMM(bestStart);
+        suggested_end = minutesToHHMM(bestStart + durM);
+      }
+    }
+    return {
+      row: {
+        id: boat.id,
+        name: boat.name,
+        image_url: boat.image_url,
+        capacity: boat.capacity,
+        short_description: boat.short_description,
+        short_description_translations: boat.short_description_translations ?? {},
+        default_duration_hours: boat.default_duration_hours,
+        min_price: boat.min_price,
+        min_price_currency: boat.min_price_currency,
+        match,
+        busy_blocks: merged.map((m) => ({ start_time: minutesToHHMM(m.s), end_time: minutesToHHMM(m.e) })),
+        suggested_start,
+        suggested_end,
+      },
+      matchOrder: match === 'exact' ? 0 : match === 'near' ? 1 : 2,
+      priority: Number(boat.search_priority ?? 0),
+      name: String(boat.name ?? ''),
+    };
+  });
+
+  enriched.sort((a, b) => {
+    if (a.matchOrder !== b.matchOrder) return a.matchOrder - b.matchOrder;
+    if (b.priority !== a.priority) return b.priority - a.priority;
+    return a.name.localeCompare(b.name);
+  });
+
+  return {
+    status: 200,
+    body: { query: { date, start_time: startTime, duration_hours: dur }, results: enriched.map((e) => e.row) },
+  };
+}
+
+// ============================================================
+// Concierge — doğal dil arama (v3.3)
+// ============================================================
+// Akış: Haiku parse (serbest metin → params) → handleSearch (DETERMİNİSTİK) →
+// Haiku narrate (gerçek sonucu cümleyle anlat, best-effort). Müsaitlik asla LLM
+// tarafından uydurulmaz; kart listesi handleSearch çıktısıdır. Hiçbir şey YAZMAZ.
+async function handleConcierge(qRaw: unknown, langRaw: unknown, todayRaw: unknown) {
+  if (!conciergeConfigured()) {
+    return { status: 503, body: { error: 'concierge_unconfigured' } };
+  }
+  if (typeof qRaw !== 'string' || !qRaw.trim()) {
+    return { status: 400, body: { error: 'q (query text) required' } };
+  }
+  const q = qRaw.trim().slice(0, 280);
+  const lang = typeof langRaw === 'string' && /^[a-z]{2}$/.test(langRaw) ? langRaw : 'en';
+  const today =
+    typeof todayRaw === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(todayRaw)
+      ? todayRaw
+      : new Date().toISOString().slice(0, 10);
+
+  // 1) Parse (LLM) — hata olursa "unclear" döner, frontend manuel forma düşer
+  let parse;
+  try {
+    parse = await parseConciergeQuery(q, today, lang);
+  } catch (e: any) {
+    console.warn('[agency-panel] concierge parse failed:', e?.message);
+    return {
+      status: 200,
+      body: { intent: 'unclear', parsed: null, results: [], message: null, assumptions: null },
+    };
+  }
+
+  if (parse.intent !== 'search' || !parse.parsed.date) {
+    return {
+      status: 200,
+      body: {
+        intent: 'unclear',
+        parsed: parse.parsed,
+        results: [],
+        message: parse.message,
+        assumptions: null,
+      },
+    };
+  }
+
+  // 2) Search (DETERMİNİSTİK) — normalizeParse default'ları uyguladı
+  const startTime = parse.parsed.start_time ?? '14:00';
+  const dur = parse.parsed.duration_hours ?? 4;
+  const search = await handleSearch(parse.parsed.date, startTime, String(dur));
+  if (search.status !== 200) {
+    return {
+      status: 200,
+      body: {
+        intent: 'unclear',
+        parsed: parse.parsed,
+        results: [],
+        message: parse.message,
+        assumptions: null,
+      },
+    };
+  }
+  const results = ((search.body as any).results ?? []) as Array<any>;
+
+  // 3) Narrate (LLM, best-effort) — yalnız gerçek sonuçları anlatır
+  const exact = results.filter((r) => r.match === 'exact');
+  const near = results.filter((r) => r.match === 'near');
+  const noneCount = results.filter((r) => r.match === 'none').length;
+  // results matchOrder→priority sıralı; grup başı = en öncelikli (CONSTANTINE öne çıkar)
+  const featured = exact[0]?.name ?? near[0]?.name ?? null;
+  const message = await narrateConciergeResults({
+    lang,
+    query: { date: parse.parsed.date, start_time: startTime, duration_hours: dur, guests: parse.parsed.guests },
+    exact: exact.map((r) => String(r.name)),
+    near: near.map((r) => ({ name: String(r.name), from: r.suggested_start ?? '', to: r.suggested_end ?? '' })),
+    noneCount,
+    featured,
+  });
+
+  return {
+    status: 200,
+    body: {
+      intent: 'search',
+      parsed: { date: parse.parsed.date, start_time: startTime, duration_hours: dur, guests: parse.parsed.guests },
+      query: (search.body as any).query,
+      results,
+      message,                     // narration (null olabilir → frontend template)
+      assumptions: parse.message,  // parse notu ("akşam=19:00") — null olabilir
+    },
+  };
 }
 
 interface RequestBody {
@@ -217,6 +524,7 @@ interface RequestBody {
   contact_info?: unknown;
   guest_name?: unknown;
   notes?: unknown;
+  source_reseller?: unknown;
 }
 
 async function handleRequest(ctx: AgencyContext, body: unknown) {
@@ -263,9 +571,13 @@ async function handleRequest(ctx: AgencyContext, body: unknown) {
   }
   const guestName = typeof b.guest_name === 'string' ? b.guest_name.trim().slice(0, 200) : null;
   const notes = typeof b.notes === 'string' ? b.notes.trim().slice(0, 1000) : null;
+  // CC white-label atıfı — talebi yönlendiren otel/reseller görünen adı (untrusted display text).
+  const sourceReseller = typeof b.source_reseller === 'string' && b.source_reseller.trim()
+    ? b.source_reseller.trim().slice(0, 120)
+    : null;
 
   const boatRows = await sql`
-    SELECT id, capacity, active FROM boats WHERE id = ${b.boat_id}
+    SELECT id, name, capacity, active FROM boats WHERE id = ${b.boat_id}
   `;
   const boat = boatRows[0];
   if (!boat || !boat.active) {
@@ -281,11 +593,13 @@ async function handleRequest(ctx: AgencyContext, body: unknown) {
   const insertRows = await sql`
     INSERT INTO agency_requests (
       agency_id, token_id, boat_id, date, start_time,
-      duration_hours, guest_count, contact_name, contact_info, guest_name, notes
+      duration_hours, guest_count, contact_name, contact_info, guest_name, notes,
+      source_reseller
     ) VALUES (
       ${ctx.agency.id}::uuid, ${ctx.token.id}::uuid, ${b.boat_id}::uuid,
       ${b.date}::date, ${startTime}::time,
-      ${dur}, ${guests}, ${contactName}, ${contactInfo}, ${guestName}, ${notes}
+      ${dur}, ${guests}, ${contactName}, ${contactInfo}, ${guestName}, ${notes},
+      ${sourceReseller}
     )
     RETURNING id
   `;
@@ -296,6 +610,44 @@ async function handleRequest(ctx: AgencyContext, body: unknown) {
 
   // Overlap detection (yeni eklediğimiz hariç)
   const overlap = await checkOverlap(b.boat_id, b.date, startMin, endMin, insertedId);
+
+  // Bildirimler — non-fatal: talep kaydedildi, bildirim hatası response'u bozmasın.
+  const summary = `${ctx.agency.name}${sourceReseller ? ` · 🏨 ${sourceReseller}` : ''} · ${b.date} ${startTime} · ${dur} saat · ${guests} kişi${overlap ? ' · ÇAKIŞMA VAR' : ''}`;
+  try {
+    const dedupeKey = `agency_request_new:${insertedId}`;
+    await sql`
+      INSERT INTO notifications (user_id, boat_id, type, title, body, link, dedupe_key)
+      SELECT p.id, ${b.boat_id}::uuid, 'agency_request_new',
+             ${`Yeni acente isteği — ${boat.name}`},
+             ${summary},
+             '/acente-istekler',
+             ${dedupeKey}
+      FROM profiles p
+      WHERE p.role = 'super_admin' AND p.active = true
+        AND NOT EXISTS (
+          SELECT 1 FROM notifications n2
+          WHERE n2.user_id = p.id AND n2.dedupe_key = ${dedupeKey}
+        )
+    `;
+  } catch (e: any) {
+    console.warn('[agency-panel] request notify (in-app) skipped:', e?.message);
+  }
+  // Mail — fire-and-forget
+  sql`
+    SELECT u.email FROM auth.users u
+    JOIN profiles p ON p.id = u.id
+    WHERE p.role = 'super_admin' AND p.active = true AND u.email IS NOT NULL
+  `
+    .then((rows) => {
+      const emails = rows.map((r: any) => r.email).filter(Boolean);
+      if (emails.length === 0) return;
+      return sendEmail({
+        to: emails,
+        subject: `Yeni acente isteği — ${boat.name} · ${b.date} ${startTime}`,
+        text: `${summary}\nİletişim: ${contactName} (${contactInfo})${guestName ? `\nMisafir: ${guestName}` : ''}${notes ? `\nNot: ${notes}` : ''}\n\nİncele: https://crm.constantineyachts.com/acente-istekler`,
+      });
+    })
+    .catch((e: any) => console.warn('[agency-panel] request notify (mail) skipped:', e?.message));
 
   return { status: 200, body: { request_id: insertedId, overlap } };
 }
@@ -318,6 +670,19 @@ async function checkOverlap(
     const bkStartMin = timeToMinutes(String(bk.start_time).slice(0, 5));
     const bkEndMin = bkStartMin + Math.round((Number(bk.duration_hours) || 4) * 60);
     if (rangesOverlapMinutes(startMin, endMin, bkStartMin, bkEndMin)) return true;
+  }
+
+  // Partner tekneler: Google takvimden senkronlanan dolu saatler
+  const slots = await sql`
+    SELECT start_time::text AS start_time, end_time::text AS end_time
+    FROM boat_busy_slots
+    WHERE boat_id = ${boatId}::uuid AND date = ${date}::date
+  `;
+  for (const s of slots) {
+    const sMin = timeToMinutes(String(s.start_time).slice(0, 5));
+    let eMin = timeToMinutes(String(s.end_time).slice(0, 5));
+    if (eMin <= sMin) eMin = 1439;
+    if (rangesOverlapMinutes(startMin, endMin, sMin, eMin)) return true;
   }
 
   const reqs = excludeRequestId
@@ -374,6 +739,23 @@ export async function handleAgencyPanel(c: Context): Promise<Response> {
         const from = c.req.query('from') ?? '';
         const to = c.req.query('to') ?? '';
         const result = await handleAvailability(boatId, from, to);
+        return c.json(result.body, result.status as any);
+      }
+      case 'search': {
+        const date = c.req.query('date') ?? '';
+        const startTime = c.req.query('start_time') ?? '';
+        const duration = c.req.query('duration_hours') ?? '';
+        const result = await handleSearch(date, startTime, duration);
+        return c.json(result.body, result.status as any);
+      }
+      case 'concierge': {
+        if (c.req.method !== 'POST') {
+          return c.json({ error: 'concierge action requires POST' }, 405);
+        }
+        let body: any;
+        try { body = await c.req.json(); }
+        catch { return c.json({ error: 'invalid JSON' }, 400); }
+        const result = await handleConcierge(body?.q, body?.lang, body?.today);
         return c.json(result.body, result.status as any);
       }
       case 'request': {

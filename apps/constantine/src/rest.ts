@@ -28,6 +28,26 @@ const PUBLIC_TABLES_VIEW = new Set([
   'public_boats', 'agency_tokens',
 ]);
 
+/**
+ * Date-aware JSON serializer.
+ *
+ * postgres-js DATE / TIMESTAMP kolonlarını JS Date object olarak döndürür.
+ * JSON.stringify Invalid Date'i `RangeError: Invalid time value` ile fırlatır;
+ * tek bir bozuk satır tüm endpoint'i 400'e düşürür. Bu replacer:
+ *   - geçerli Date → ISO string
+ *   - Invalid Date → null  (sessizce, log gürültüsü yok)
+ *   - diğer her şey → değişmeden
+ */
+function safeStringify(data: unknown): string {
+  return JSON.stringify(data, (_k, v) => {
+    if (v instanceof Date) {
+      const t = v.getTime();
+      return Number.isFinite(t) ? v.toISOString() : null;
+    }
+    return v;
+  });
+}
+
 export async function handleRest(c: Context, method: string, table: string): Promise<Response> {
   const auth = c.get('auth');
   const op: 'read' | 'write' = method === 'GET' ? 'read' : 'write';
@@ -82,11 +102,11 @@ export async function handleRest(c: Context, method: string, table: string): Pro
         // PostgREST .single() / .maybeSingle() support
         const accept = c.req.header('accept') || c.req.header('Accept') || '';
         if (accept.includes('application/vnd.pgrst.object+json')) {
-          if (rows.length === 1) return new Response(JSON.stringify(rows[0]), { status: 200, headers });
+          if (rows.length === 1) return new Response(safeStringify(rows[0]), { status: 200, headers });
           if (rows.length === 0) return new Response(JSON.stringify({ code: 'PGRST116', message: 'JSON object requested, multiple (or no) rows returned', details: 'Results contain 0 rows' }), { status: 406, headers });
           return new Response(JSON.stringify({ code: 'PGRST116', message: 'JSON object requested, multiple (or no) rows returned', details: 'Results contain ' + rows.length + ' rows' }), { status: 406, headers });
         }
-        return new Response(JSON.stringify(rows), { status: 200, headers });
+        return new Response(safeStringify(rows), { status: 200, headers });
       });
     }
 
@@ -107,11 +127,11 @@ export async function handleRest(c: Context, method: string, table: string): Pro
         const accept = c.req.header('accept') || c.req.header('Accept') || '';
         if (accept.includes('application/vnd.pgrst.object+json')) {
           if (inserted.length === 1) {
-            return new Response(JSON.stringify(inserted[0]), { status: 201, headers: { 'Content-Type': 'application/json' } });
+            return new Response(safeStringify(inserted[0]), { status: 201, headers: { 'Content-Type': 'application/json' } });
           }
           return new Response(JSON.stringify({ code: 'PGRST116', message: 'JSON object requested, multiple (or no) rows returned', details: 'Results contain ' + inserted.length + ' rows' }), { status: 406, headers: { 'Content-Type': 'application/json' } });
         }
-        return new Response(JSON.stringify(inserted), { status: 201, headers: { 'Content-Type': 'application/json' } });
+        return new Response(safeStringify(inserted), { status: 201, headers: { 'Content-Type': 'application/json' } });
       });
     }
 
@@ -129,11 +149,11 @@ export async function handleRest(c: Context, method: string, table: string): Pro
         const accept = c.req.header('accept') || c.req.header('Accept') || '';
         if (accept.includes('application/vnd.pgrst.object+json')) {
           if (updated.length === 1) {
-            return new Response(JSON.stringify(updated[0]), { status: 200, headers: { 'Content-Type': 'application/json' } });
+            return new Response(safeStringify(updated[0]), { status: 200, headers: { 'Content-Type': 'application/json' } });
           }
           return new Response(JSON.stringify({ code: 'PGRST116', message: 'JSON object requested, multiple (or no) rows returned', details: 'Results contain ' + updated.length + ' rows' }), { status: 406, headers: { 'Content-Type': 'application/json' } });
         }
-        return new Response(JSON.stringify(updated), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        return new Response(safeStringify(updated), { status: 200, headers: { 'Content-Type': 'application/json' } });
       });
     }
 
@@ -148,11 +168,11 @@ export async function handleRest(c: Context, method: string, table: string): Pro
         const accept = c.req.header('accept') || c.req.header('Accept') || '';
         if (accept.includes('application/vnd.pgrst.object+json')) {
           if (deleted.length === 1) {
-            return new Response(JSON.stringify(deleted[0]), { status: 200, headers: { 'Content-Type': 'application/json' } });
+            return new Response(safeStringify(deleted[0]), { status: 200, headers: { 'Content-Type': 'application/json' } });
           }
           return new Response(JSON.stringify({ code: 'PGRST116', message: 'JSON object requested, multiple (or no) rows returned', details: 'Results contain ' + deleted.length + ' rows' }), { status: 406, headers: { 'Content-Type': 'application/json' } });
         }
-        return new Response(JSON.stringify(deleted), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        return new Response(safeStringify(deleted), { status: 200, headers: { 'Content-Type': 'application/json' } });
       });
     }
 

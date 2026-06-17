@@ -21,11 +21,15 @@ const BOUNCE_RATE_THRESHOLD = 0.05;
 const COMPLAINT_RATE_THRESHOLD = 0.001;
 
 export function capForDay(day: number): number {
-  if (day <= 3) return 50;
-  if (day <= 7) return 100;
-  if (day <= 10) return 200;
-  if (day <= 14) return 500;
-  return 1000;
+  // COLD B2B OUTREACH ramp (yeni domain). Per-campaign GÜNLÜK tavan.
+  // Bu değerler 2 gönderici mailbox varsayımıyla seçildi → değer ÷ mailbox = mailbox başına/gün.
+  // ESKİ eğri (50/100/200/500/1000) transactional/warmup-pool içindi; cold outreach'te
+  // yeni domaini ilk haftada yakardı. Cold'da güvenli tavan ~25 mail/mailbox/gün.
+  // NOT: 1 mailbox'a düşersen daily_cap'i elle indir (tavan tek mailbox'a yüklenir).
+  if (day <= 3) return 20;   // ~10/mailbox — ilk dokunuş, çok temkinli
+  if (day <= 7) return 30;   // ~15/mailbox
+  if (day <= 14) return 40;  // ~20/mailbox
+  return 50;                 // ~25/mailbox — cold steady-state tavan (üstüne çıkma)
 }
 
 export interface WarmupTickResult {

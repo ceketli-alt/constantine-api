@@ -26,6 +26,7 @@ import { sendTestEmail, sendEmail } from './resend-send.js';
 import { handleNotificationsDispatch, startNotificationsRunner } from './notifications-dispatch.js';
 import { handleStorefrontApi } from './storefront-api.js';
 import { handleCcStripe } from './cc-stripe.js';
+import { handleYachtsProxy } from './yachts-proxy.js';
 import {
   verifyAnyJWT,
   verifyRefreshToken,
@@ -507,6 +508,9 @@ app.post('/functions/v1/email-test', async (c) => {
 
 // Storefront public API — catalog/product/availability/booking/voucher/reviews
 app.all('/functions/v1/storefront-api', (c) => handleStorefrontApi(c));
+
+// Private Yachts — Constantine agency-panel proxy'si (token sunucu tarafında, bkz. yachts-proxy.ts)
+app.all('/functions/v1/yachts-api', (c) => handleYachtsProxy(c));
 
 // Stripe — checkout session create + webhook (capture → ledger). Key-gated.
 app.all('/functions/v1/cc-stripe', (c) => handleCcStripe(c));

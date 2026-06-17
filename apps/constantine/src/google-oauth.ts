@@ -60,32 +60,54 @@ export async function handleGoogleOAuthCallback(c: Context): Promise<Response> {
   // ---------- MODE 1: INIT ----------
   if (init === '1') {
     const boatId = url.searchParams.get('boat_id');
-    if (!boatId) return c.json({ error: 'boat_id required' }, 400);
+    const onboardingToken = url.searchParams.get('onboarding_token');
 
-    const auth = requireAuth(c);
-    if (!auth) return c.json({ error: 'unauthorized' }, 401);
+    // İki yetki yolu: (1) admin/partner login, (2) geçerli onboarding davet token'ı (kaptan, login YOK).
+    let resolvedBoatId: string;
+    let stateUserId: string | null;
 
-    // role + can_manage_boat kontrol
-    const profileRows = await sql`SELECT role::text AS role FROM profiles WHERE id = ${auth.userId} LIMIT 1`;
-    const role = profileRows[0]?.role;
-    if (!role || (role !== 'super_admin' && role !== 'partner')) {
-      return c.json({ error: 'forbidden' }, 403);
-    }
-    // super_admin tüm boat'ları, partner sadece atandığı boat'ı yönetebilir
-    if (role === 'partner') {
-      const assigns = await sql`
-        SELECT 1 FROM boat_assignments WHERE user_id = ${auth.userId} AND boat_id = ${boatId} AND role = 'partner' LIMIT 1
+    if (onboardingToken) {
+      // Public kaptan onboarding — davet token boat'a çözülür (v4).
+      const invRows = await sql<Array<{ boat_id: string | null; status: string; expires_at: string; created_by: string | null }>>`
+        SELECT boat_id, status, expires_at::text AS expires_at, created_by
+        FROM boat_onboarding_invites WHERE token = ${onboardingToken} LIMIT 1
       `;
-      if (assigns.length === 0) return c.json({ error: 'forbidden', boat_id: boatId }, 403);
+      const inv = invRows[0];
+      if (!inv || !inv.boat_id) return c.json({ error: 'invalid_onboarding_token' }, 401);
+      if (inv.status === 'published' || new Date(inv.expires_at).getTime() < Date.now()) {
+        return c.json({ error: 'onboarding_token_expired' }, 410);
+      }
+      resolvedBoatId = inv.boat_id;
+      stateUserId = inv.created_by; // davet eden admin (audit: google_connected_by)
+    } else {
+      if (!boatId) return c.json({ error: 'boat_id required' }, 400);
+      const auth = requireAuth(c);
+      if (!auth) return c.json({ error: 'unauthorized' }, 401);
+      const profileRows = await sql`SELECT role::text AS role FROM profiles WHERE id = ${auth.userId} LIMIT 1`;
+      const role = profileRows[0]?.role;
+      if (!role || (role !== 'super_admin' && role !== 'partner')) {
+        return c.json({ error: 'forbidden' }, 403);
+      }
+      // super_admin tüm boat'ları, partner sadece atandığı boat'ı yönetebilir
+      if (role === 'partner') {
+        const assigns = await sql`
+          SELECT 1 FROM boat_assignments WHERE user_id = ${auth.userId} AND boat_id = ${boatId} AND role = 'partner' LIMIT 1
+        `;
+        if (assigns.length === 0) return c.json({ error: 'forbidden', boat_id: boatId }, 403);
+      }
+      resolvedBoatId = boatId;
+      stateUserId = auth.userId;
     }
 
     // CSRF state üret + kaydet
     // Backend B8 fix: expires_at explicit set — DB default'una bel bağlama, eski state'ler
     // replay edilebilirdi (callback'te `new Date(null) < new Date()` = false, hiç expire olmaz).
+    // 48 saat: partner tekne sahibine link WhatsApp'la gönderilip sonra tıklanabilsin.
+    // Güvenlik aynı: tek kullanımlık (consumed_at), boat-scoped, init auth'lu.
     const stateToken = crypto.randomUUID() + '-' + crypto.randomUUID();
     await sql`
       INSERT INTO google_oauth_states (state, boat_id, user_id, expires_at)
-      VALUES (${stateToken}, ${boatId}, ${auth.userId}, now() + interval '10 minutes')
+      VALUES (${stateToken}, ${resolvedBoatId}, ${stateUserId}, now() + interval '48 hours')
     `;
 
     const authUrl = new URL(GOOGLE_OAUTH_AUTH_URL);
@@ -111,9 +133,28 @@ export async function handleGoogleOAuthCallback(c: Context): Promise<Response> {
     LIMIT 1
   `;
   const stateRow = stateRows[0];
-  if (!stateRow) return htmlResult('Geçersiz state', 'OAuth flow başlatılmamış veya state süresi dolmuş.', false);
-  if (stateRow.consumed_at) return htmlResult('State zaten kullanıldı', 'Bu bağlantı linki tek kullanımlıktır.', false);
-  if (new Date(stateRow.expires_at) < new Date()) return htmlResult('State süresi doldu', 'Lütfen bağlama işlemini tekrar başlatın.', false);
+  if (!stateRow) {
+    return htmlResult(
+      'Bağlantı linki geçersiz',
+      'Bu bağlantı linki tanınmadı. Lütfen Constantine yetkilisinden yeni bir bağlantı linki isteyin.',
+      false,
+    );
+  }
+  if (stateRow.consumed_at) {
+    return htmlResult(
+      'Bu link daha önce kullanılmış',
+      'Bağlantı linkleri tek kullanımlıktır ve bu link daha önce kullanılmış. ' +
+        'Lütfen Constantine yetkilisinden YENİ bir bağlantı linki isteyip onunla tekrar deneyin.',
+      false,
+    );
+  }
+  if (new Date(stateRow.expires_at) < new Date()) {
+    return htmlResult(
+      'Bağlantı linkinin süresi dolmuş',
+      'Bu bağlantı linkinin süresi dolmuş. Lütfen Constantine yetkilisinden yeni bir bağlantı linki isteyin.',
+      false,
+    );
+  }
 
   try {
     const tokens = await exchangeCodeForToken(code, REDIRECT_URI);
@@ -121,6 +162,18 @@ export async function handleGoogleOAuthCallback(c: Context): Promise<Response> {
       return htmlResult('Refresh token alınamadı',
         'Google hesabınızdan bu uygulamanın iznini kaldırıp tekrar deneyin: myaccount.google.com/permissions',
         false);
+    }
+
+    // Takvim izni GERÇEKTEN verildi mi? Email-only grant'te freeBusy 403
+    // ACCESS_TOKEN_SCOPE_INSUFFICIENT döner; yanlışlıkla "bağlandı ✓" yazmayalım.
+    // Tekneci izin ekranında takvim kutucuğunu işaretlemezse buraya düşer.
+    if (!tokens.scope || !tokens.scope.includes(GOOGLE_SCOPE)) {
+      return htmlResult(
+        'Takvim izni eksik',
+        'Bağlantı tamamlanamadı çünkü "Google Takvim" erişim izni onaylanmadı. ' +
+          'Lütfen linke tekrar tıklayın ve izin ekranında TAKVİM kutucuğunu işaretleyerek devam edin.',
+        false,
+      );
     }
 
     const userInfo = await fetchGoogleUserInfo(tokens.access_token);

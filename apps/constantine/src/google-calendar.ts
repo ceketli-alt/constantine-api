@@ -13,7 +13,7 @@ import {
   deleteCalendarEvent,
 } from './google.js';
 
-function isoToLocalParts(iso: string, tz: string): { date: string; time: string } {
+export function isoToLocalParts(iso: string, tz: string): { date: string; time: string } {
   const d = new Date(iso);
   try {
     const fmt = new Intl.DateTimeFormat('en-CA', {
@@ -366,6 +366,29 @@ export async function handleCalendarPush(c: Context): Promise<Response> {
     // Credential satırı eksik veya refresh token revoke — sessizce skip / friendly mesaj.
     if (msg.includes('Google bağlantısı yok')) {
       return c.json({ skipped: 'boat_credentials_missing', boat_id: bk.boat_id, boat_name: bk.boat_name });
+    }
+    // OAuth expire / revoke — super_admin'lere idempotent bildirim, 200 friendly response.
+    if (msg.includes('refresh failed') || msg.includes('invalid_grant')) {
+      try {
+        const dedupeKey = `google_oauth_expired:${bk.boat_id}`;
+        await sql`
+          INSERT INTO notifications (user_id, boat_id, type, title, body, link, dedupe_key)
+          SELECT p.id, ${bk.boat_id}, 'google_oauth_expired',
+                 ${`⚠ ${bk.boat_name || 'Tekne'} için Google bağlantısı koptu`},
+                 'Refresh token revoke / expire olmuş; tekne ayarlarından yeniden bağlanmanız gerekiyor.',
+                 '/settings',
+                 ${dedupeKey}
+          FROM profiles p
+          WHERE p.role = 'super_admin' AND p.active = true
+            AND NOT EXISTS (
+              SELECT 1 FROM notifications n2
+              WHERE n2.user_id = p.id AND n2.dedupe_key = ${dedupeKey}
+            )
+        `;
+      } catch (notifErr: any) {
+        console.error('[handleCalendarPush] OAuth-expired notify error:', notifErr?.message);
+      }
+      return c.json({ skipped: 'boat_oauth_expired', boat_id: bk.boat_id, boat_name: bk.boat_name });
     }
     throw err;
   }

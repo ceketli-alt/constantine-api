@@ -1,12 +1,16 @@
 /**
- * Mailcow IMAP → CRM reply köprüsü.
+ * IMAP → CRM reply köprüsü (multi-host).
  *
  * Cold outreach reply'ları @constantineyachts.online'a (Mailcow) düşer; Resend Inbound
- * webhook'una DEĞİL. Bu poller Mailcow mailbox'larını IMAP'tan okur ve reply'ları
+ * webhook'una DEĞİL. Bu poller IMAP mailbox'larını okur ve reply'ları
  * `processInboundEmail` ile CRM'e işler → takip sequence durur + reply-classify + A/B reply-rate.
  *
+ * 2026-06-10: Multi-host destek eklendi. Mailcow (cy.online) ile info@cy.com (farklı
+ * IMAP sunucu) aynı kod yoluyla poll'lanır. Her host için ayrı timer + watermark.
+ *
  * Tasarım kararları (güvenlik + Instantly ile birlikte yaşama):
- *  - GATED: `MAILCOW_REPLY_POLLER_ENABLED=true` değilse hiç başlamaz.
+ *  - GATED: `MAILCOW_REPLY_POLLER_ENABLED=true` değilse Mailcow grubu başlamaz.
+ *           `INFO_IMAP_ENABLED=true` ise info grubu da başlar.
  *  - LAZY import: imapflow/mailparser/db/email-inbound sadece poll çalışınca yüklenir →
  *    eksik dep VEYA DATABASE_URL'siz test ortamı modülü import etmeyi KIRMAZ (saf helper'lar test edilebilir).
  *  - READ-ONLY mailbox + UID watermark: mesajlara DOKUNMAZ (\Seen değişmez). Instantly aynı
@@ -15,13 +19,21 @@
  *  - processInboundEmail message_id_header ile idempotent → tekrar okuma güvenli.
  *  - Lead eşleşmeyen mailler (warmup/spam) processInboundEmail'de no_lead_match → atlanır.
  *
- * Env:
+ * Env (Mailcow grubu — legacy):
  *  MAILCOW_REPLY_POLLER_ENABLED   '1'/'true' → aktif
  *  MAILCOW_IMAP_HOST              default mail.constantineyachts.online
  *  MAILCOW_IMAP_PORT              default 993
  *  MAILCOW_REPLY_MAILBOXES       "user1:pass1,user2:pass2"
  *  MAILCOW_REPLY_POLL_MS         default 180000 (3 dk)
  *  MAILCOW_REPLY_MAX_PER_TICK    default 50 (mailbox başına tick limiti)
+ *
+ * Env (Info grubu — 2026-06-10):
+ *  INFO_IMAP_ENABLED              '1'/'true' → aktif
+ *  INFO_IMAP_HOST                 default mail.constantineyachts.com
+ *  INFO_IMAP_PORT                 default 993
+ *  INFO_IMAP_MAILBOXES            "info@constantineyachts.com:SECRET"
+ *  INFO_IMAP_POLL_MS              default = MAILCOW_REPLY_POLL_MS
+ *  INFO_IMAP_MAX_PER_TICK         default = MAILCOW_REPLY_MAX_PER_TICK
  */
 
 const ENABLED = ['1', 'true', 'yes'].includes((process.env.MAILCOW_REPLY_POLLER_ENABLED ?? '').toLowerCase());
@@ -29,6 +41,16 @@ const IMAP_HOST = process.env.MAILCOW_IMAP_HOST ?? 'mail.constantineyachts.onlin
 const IMAP_PORT = Number(process.env.MAILCOW_IMAP_PORT ?? 993);
 const POLL_MS = Number(process.env.MAILCOW_REPLY_POLL_MS ?? 180_000);
 const MAX_PER_TICK = Number(process.env.MAILCOW_REPLY_MAX_PER_TICK ?? 50);
+
+/** Bir IMAP grubunun çalışma konfigürasyonu — multi-host destek için. */
+interface PollerInstance {
+  label: string;        // log + state için anlamlı isim ('mailcow', 'info')
+  host: string;
+  port: number;
+  mailboxes: Mailbox[];
+  pollMs: number;
+  maxPerTick: number;
+}
 
 interface Mailbox {
   user: string;
@@ -91,15 +113,23 @@ async function writeWatermark(sql: any, mailbox: string, wm: Watermark): Promise
 }
 
 /** Tek mailbox'ı yokla. Hata fırlatmaz — loglar ve döner. */
-async function pollMailbox(mb: Mailbox, deps: PollDeps): Promise<{ processed: number; tracked: number }> {
+async function pollMailbox(
+  mb: Mailbox,
+  deps: PollDeps,
+  conn: { host: string; port: number; maxPerTick: number },
+): Promise<{ processed: number; tracked: number }> {
   const { ImapFlow, simpleParser, sql, processInboundEmail } = deps;
   const stat = { processed: 0, tracked: 0 };
   const client = new ImapFlow({
-    host: IMAP_HOST,
-    port: IMAP_PORT,
+    host: conn.host,
+    port: conn.port,
     secure: true,
     auth: { user: mb.user, pass: mb.pass },
     logger: false,
+  });
+  // imapflow TLS kapanınca 'error' event fırlatır; listener olmasa unhandled exception → process crash
+  client.on('error', (e: any) => {
+    console.warn(`[reply-poller] ${mb.user} imap client error:`, e?.message ?? e);
   });
 
   try {
@@ -127,7 +157,7 @@ async function pollMailbox(mb: Mailbox, deps: PollDeps): Promise<{ processed: nu
     for await (const msg of client.fetch(`${lastUid + 1}:*`, { source: true, internalDate: true }, { uid: true })) {
       if (typeof msg.uid !== 'number' || msg.uid <= lastUid) continue; // "N:*" quirk guard
       collected.push(msg);
-      if (collected.length >= MAX_PER_TICK) break;
+      if (collected.length >= conn.maxPerTick) break;
     }
 
     for (const msg of collected) {
@@ -180,16 +210,31 @@ async function pollMailbox(mb: Mailbox, deps: PollDeps): Promise<{ processed: nu
 
 let pollingNow = false;
 
-/** Bir poll turu — tüm mailbox'lar. Hata izole, asla throw etmez. Lazy import (test/startup güvenli). */
-export async function runMailcowReplyPollOnce(): Promise<{ ok: boolean; mailboxes: number; processed: number; tracked: number; reason?: string }> {
-  const mailboxes = parseMailboxes(process.env.MAILCOW_REPLY_MAILBOXES);
-  if (mailboxes.length === 0) {
-    return { ok: false, mailboxes: 0, processed: 0, tracked: 0, reason: 'no_mailboxes_configured' };
+// pollingNow Mailcow grubu için tek-tick guard; multi-host'ta her grup için ayrı.
+const pollingLocks = new Set<string>();
+
+/**
+ * Bir grubun (config'in) tüm mailbox'larını yokla. Hata izole, throw etmez.
+ * Config verilmezse legacy Mailcow grubu env'lerinden oluşturulur (backward compat).
+ */
+export async function runReplyPollOnce(
+  cfg?: PollerInstance,
+): Promise<{ ok: boolean; mailboxes: number; processed: number; tracked: number; reason?: string; label?: string }> {
+  const config: PollerInstance = cfg ?? {
+    label: 'mailcow',
+    host: IMAP_HOST,
+    port: IMAP_PORT,
+    mailboxes: parseMailboxes(process.env.MAILCOW_REPLY_MAILBOXES),
+    pollMs: POLL_MS,
+    maxPerTick: MAX_PER_TICK,
+  };
+  if (config.mailboxes.length === 0) {
+    return { ok: false, mailboxes: 0, processed: 0, tracked: 0, reason: 'no_mailboxes_configured', label: config.label };
   }
-  if (pollingNow) {
-    return { ok: false, mailboxes: mailboxes.length, processed: 0, tracked: 0, reason: 'already_running' };
+  if (pollingLocks.has(config.label)) {
+    return { ok: false, mailboxes: config.mailboxes.length, processed: 0, tracked: 0, reason: 'already_running', label: config.label };
   }
-  pollingNow = true;
+  pollingLocks.add(config.label);
   let processed = 0;
   let tracked = 0;
   try {
@@ -198,47 +243,99 @@ export async function runMailcowReplyPollOnce(): Promise<{ ok: boolean; mailboxe
     const { sql } = await import('./db.js');
     const { processInboundEmail } = await import('./email-inbound.js');
     const deps: PollDeps = { ImapFlow, simpleParser, sql, processInboundEmail };
-    for (const mb of mailboxes) {
+    const conn = { host: config.host, port: config.port, maxPerTick: config.maxPerTick };
+    for (const mb of config.mailboxes) {
       try {
-        const r = await pollMailbox(mb, deps);
+        const r = await pollMailbox(mb, deps, conn);
         processed += r.processed;
         tracked += r.tracked;
       } catch (e: any) {
-        console.warn(`[reply-poller] ${mb.user} bağlantı/poll hata:`, e?.message);
+        console.warn(`[reply-poller:${config.label}] ${mb.user} bağlantı/poll hata:`, e?.message);
       }
     }
-    if (processed > 0) console.log(`[reply-poller] tur bitti: processed=${processed} tracked=${tracked}`);
-    return { ok: true, mailboxes: mailboxes.length, processed, tracked };
+    if (processed > 0) console.log(`[reply-poller:${config.label}] tur bitti: processed=${processed} tracked=${tracked}`);
+    return { ok: true, mailboxes: config.mailboxes.length, processed, tracked, label: config.label };
   } finally {
-    pollingNow = false;
+    pollingLocks.delete(config.label);
   }
 }
 
-let timer: NodeJS.Timeout | null = null;
+/** Backward compat — eski kodun çağırdığı fonksiyon. */
+export const runMailcowReplyPollOnce = runReplyPollOnce;
 
-export function startMailcowReplyPoller(): void {
-  if (!ENABLED) {
-    console.log('[reply-poller] disabled (MAILCOW_REPLY_POLLER_ENABLED yok) — başlatılmadı');
-    return;
-  }
-  const mailboxes = parseMailboxes(process.env.MAILCOW_REPLY_MAILBOXES);
-  if (mailboxes.length === 0) {
-    console.warn('[reply-poller] MAILCOW_REPLY_MAILBOXES boş — başlatılmadı');
-    return;
-  }
-  console.log(`[reply-poller] starting (poll=${POLL_MS}ms, mailboxes=${mailboxes.length}, host=${IMAP_HOST})`);
+const timers: NodeJS.Timeout[] = [];
+
+function startSinglePoller(cfg: PollerInstance): void {
+  console.log(`[reply-poller:${cfg.label}] starting (poll=${cfg.pollMs}ms, mailboxes=${cfg.mailboxes.length}, host=${cfg.host})`);
   // İlk tur kısa gecikmeyle (startup'ı bloklamadan)
-  setTimeout(() => { runMailcowReplyPollOnce().catch((e) => console.warn('[reply-poller] ilk tur hata:', e?.message)); }, 5_000);
-  timer = setInterval(() => {
-    runMailcowReplyPollOnce().catch((e) => console.warn('[reply-poller] tur hata:', e?.message));
-  }, POLL_MS);
-  if (typeof timer.unref === 'function') timer.unref();
+  setTimeout(() => {
+    runReplyPollOnce(cfg).catch((e) => console.warn(`[reply-poller:${cfg.label}] ilk tur hata:`, e?.message));
+  }, 5_000);
+  const t = setInterval(() => {
+    runReplyPollOnce(cfg).catch((e) => console.warn(`[reply-poller:${cfg.label}] tur hata:`, e?.message));
+  }, cfg.pollMs);
+  if (typeof t.unref === 'function') t.unref();
+  timers.push(t);
+}
+
+/**
+ * Tüm poller gruplarını başlat.
+ * Mailcow grubu: MAILCOW_REPLY_POLLER_ENABLED=true ise.
+ * Info grubu  : INFO_IMAP_ENABLED=true ise.
+ */
+export function startMailcowReplyPoller(): void {
+  let started = 0;
+
+  // Grup 1 — Mailcow (legacy, cold outreach)
+  if (ENABLED) {
+    const mailcow: PollerInstance = {
+      label: 'mailcow',
+      host: IMAP_HOST,
+      port: IMAP_PORT,
+      mailboxes: parseMailboxes(process.env.MAILCOW_REPLY_MAILBOXES),
+      pollMs: POLL_MS,
+      maxPerTick: MAX_PER_TICK,
+    };
+    if (mailcow.mailboxes.length === 0) {
+      console.warn('[reply-poller:mailcow] MAILCOW_REPLY_MAILBOXES boş — başlatılmadı');
+    } else {
+      startSinglePoller(mailcow);
+      started++;
+    }
+  } else {
+    console.log('[reply-poller:mailcow] disabled (MAILCOW_REPLY_POLLER_ENABLED yok)');
+  }
+
+  // Grup 2 — Info (cy.com mail server, manuel mail + eski info@'a düşen reply'ler)
+  const infoEnabled = ['1', 'true', 'yes'].includes((process.env.INFO_IMAP_ENABLED ?? '').toLowerCase());
+  if (infoEnabled) {
+    const info: PollerInstance = {
+      label: 'info',
+      host: process.env.INFO_IMAP_HOST ?? 'mail.constantineyachts.com',
+      port: Number(process.env.INFO_IMAP_PORT ?? 993),
+      mailboxes: parseMailboxes(process.env.INFO_IMAP_MAILBOXES),
+      pollMs: Number(process.env.INFO_IMAP_POLL_MS ?? POLL_MS),
+      maxPerTick: Number(process.env.INFO_IMAP_MAX_PER_TICK ?? MAX_PER_TICK),
+    };
+    if (info.mailboxes.length === 0) {
+      console.warn('[reply-poller:info] INFO_IMAP_MAILBOXES boş — başlatılmadı');
+    } else {
+      startSinglePoller(info);
+      started++;
+    }
+  } else {
+    console.log('[reply-poller:info] disabled (INFO_IMAP_ENABLED yok)');
+  }
+
+  if (started === 0) {
+    console.log('[reply-poller] hiçbir grup aktif değil');
+  }
 }
 
 export function stopMailcowReplyPoller(): void {
-  if (timer) {
-    clearInterval(timer);
-    timer = null;
-    console.log('[reply-poller] stopped');
+  while (timers.length > 0) {
+    const t = timers.pop();
+    if (t) clearInterval(t);
   }
+  console.log('[reply-poller] all groups stopped');
 }

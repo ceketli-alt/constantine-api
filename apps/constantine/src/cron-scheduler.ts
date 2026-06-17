@@ -19,6 +19,7 @@ import { runWarmupTick } from './cron-warmup-tick.js';
 import { runRecomputeScores } from './cron-recompute-scores.js';
 import { runSalesDailyDigest } from './cron-daily-digest.js';
 import { runOpsDailyDigest } from './daily-digest.js';
+import { runPartnerCalendarSync } from './partner-calendar-sync.js';
 
 let warmupTask: ScheduledTask | null = null;
 let scoresTask: ScheduledTask | null = null;
@@ -27,6 +28,8 @@ let recurringTask: ScheduledTask | null = null;
 let digestTask: ScheduledTask | null = null;
 let opsDigestTask: ScheduledTask | null = null;
 let opsEveningDigestTask: ScheduledTask | null = null;
+let notifCleanupTask: ScheduledTask | null = null;
+let partnerSyncTask: ScheduledTask | null = null;
 
 async function loadCronEnabled(): Promise<boolean> {
   try {
@@ -94,6 +97,23 @@ async function safeRunScores(): Promise<void> {
   }
 }
 
+/** Partner tekne takvim senkronu — 10dk'da bir, sessiz (yalnız hata/aktivitede log).
+ *  app_config 'partner.cron.last_calendar_sync' kaydını runPartnerCalendarSync kendisi yazar
+ *  (manuel tetik de aynı yere yazsın diye). */
+async function safeRunPartnerSync(): Promise<void> {
+  if (!(await loadCronEnabled())) {
+    return;
+  }
+  try {
+    const result = await runPartnerCalendarSync();
+    if (result.errors.length > 0 || result.slots > 0) {
+      console.log(`[cron-scheduler] partner-sync: boats=${result.boats} synced=${result.synced} slots=${result.slots} errors=${result.errors.length}`);
+    }
+  } catch (e: any) {
+    console.error('[cron-scheduler] partner-sync error:', e?.message);
+  }
+}
+
 /** Geciken görevleri tara, task_overdue activity_events ekle. DB'deki fn_log_task_overdue() */
 export async function runOverdueTick(): Promise<{ ok: true }> {
   try {
@@ -151,6 +171,70 @@ async function safeRunOpsDigest(variant: 'morning' | 'evening'): Promise<void> {
     console.error(`[cron-scheduler] ops digest (${variant}) error:`, e?.message);
     await writeLastRun(`ops.cron.last_daily_digest_${variant}`, { error: e?.message ?? 'unknown' });
   }
+}
+
+/** Notifications retention — 90 gün okunmuş + 180 gün okunmamış sil.
+ *  Bell ikonunda biriken bildirim sayısını kontrol altında tutar, eski okunmuşlar
+ *  veritabanını şişirmesin. Yeni notification akışı zaten dedupe_key ile idempotent. */
+export async function runNotificationCleanup(): Promise<{ deleted_read: number; deleted_unread: number }> {
+  let deletedRead = 0;
+  let deletedUnread = 0;
+  try {
+    const r1 = await sql`
+      DELETE FROM notifications
+      WHERE read_at IS NOT NULL AND read_at < now() - interval '90 days'
+      RETURNING id
+    `;
+    deletedRead = r1.length;
+  } catch (e: any) {
+    console.error('[cron-scheduler] notif cleanup (read) error:', e?.message);
+  }
+  try {
+    const r2 = await sql`
+      DELETE FROM notifications
+      WHERE read_at IS NULL AND created_at < now() - interval '180 days'
+      RETURNING id
+    `;
+    deletedUnread = r2.length;
+  } catch (e: any) {
+    console.error('[cron-scheduler] notif cleanup (unread) error:', e?.message);
+  }
+  if (deletedRead > 0 || deletedUnread > 0) {
+    console.log(`[cron-scheduler] notif cleanup: deleted_read=${deletedRead} deleted_unread=${deletedUnread}`);
+  }
+  await writeLastRun('cron.last_notif_cleanup', { deleted_read: deletedRead, deleted_unread: deletedUnread });
+  return { deleted_read: deletedRead, deleted_unread: deletedUnread };
+}
+
+/** lead_scores retention — lead başına en yeni LEAD_SCORES_KEEP_PER_LEAD snapshot tutulur.
+ *  recompute-scores cron'u (15dk) recency_factor zaman-decay'i nedeniyle skor değişmese bile
+ *  her tick yeni satır INSERT ediyor → sınırsız büyüme (22 günde 100k satır / 67MB). Bu retention
+ *  tabloyu ~20×lead_sayısı'nda sabitler, lead'in EN SON skoru asla silinmez (rn=1 hep korunur),
+ *  ~26 gün trend geçmişi kalır. Tamamen türetilmiş veri — kaynak leads + email_events'ten yeniden
+ *  hesaplanabilir, audit gerektirmez. */
+const LEAD_SCORES_KEEP_PER_LEAD = 20;
+export async function runLeadScoresCleanup(): Promise<{ deleted: number }> {
+  let deleted = 0;
+  try {
+    const r = await sql`
+      WITH ranked AS (
+        SELECT id, row_number() OVER (PARTITION BY lead_id ORDER BY computed_at DESC) AS rn
+        FROM lead_scores
+      )
+      DELETE FROM lead_scores ls
+      USING ranked
+      WHERE ls.id = ranked.id AND ranked.rn > ${LEAD_SCORES_KEEP_PER_LEAD}
+      RETURNING ls.id
+    `;
+    deleted = r.length;
+  } catch (e: any) {
+    console.error('[cron-scheduler] lead_scores cleanup error:', e?.message);
+  }
+  if (deleted > 0) {
+    console.log(`[cron-scheduler] lead_scores cleanup: deleted=${deleted} (keep_per_lead=${LEAD_SCORES_KEEP_PER_LEAD})`);
+  }
+  await writeLastRun('cron.last_lead_scores_cleanup', { deleted, keep_per_lead: LEAD_SCORES_KEEP_PER_LEAD });
+  return { deleted };
 }
 
 /** Tekrarlı görev + gider şablonlarını instantiate et. DB'deki generate_recurring_tasks/_expenses() */
@@ -216,6 +300,18 @@ export function startCronScheduler(): void {
     safeRunOpsDigest('evening').catch((e) => console.error('[cron-scheduler] ops evening unhandled:', e?.message));
   }, { timezone: 'UTC' });
 
+  // gece temizliği — her gün 01:00 UTC (TR 04:00), diğer 00:00 cron'larla çakışmasın.
+  // notifications retention + lead_scores retention birlikte koşar.
+  notifCleanupTask = cron.schedule('0 1 * * *', () => {
+    runNotificationCleanup().catch((e) => console.error('[cron-scheduler] notif cleanup unhandled:', e?.message));
+    runLeadScoresCleanup().catch((e) => console.error('[cron-scheduler] lead_scores cleanup unhandled:', e?.message));
+  }, { timezone: 'UTC' });
+
+  // partner tekne takvim senkronu: 10dk'da bir — agency_only tekneler freeBusy → boat_busy_slots
+  partnerSyncTask = cron.schedule('*/10 * * * *', () => {
+    safeRunPartnerSync().catch((e) => console.error('[cron-scheduler] partner-sync unhandled:', e?.message));
+  }, { timezone: 'UTC' });
+
   console.log('[cron-scheduler] scheduled:');
   console.log('  - warmup-tick: cron("0 0 * * *", UTC)');
   console.log('  - recompute-scores: cron("*/15 * * * *", UTC)');
@@ -224,6 +320,9 @@ export function startCronScheduler(): void {
   console.log('  - sales daily digest: cron("0 5 * * *", UTC = TR 08:00)');
   console.log('  - ops daily digest [morning]: cron("0 6 * * *", UTC = TR 09:00)');
   console.log('  - ops daily digest [evening]: cron("0 20 * * *", UTC = TR 23:00)');
+  console.log('  - notifications cleanup: cron("0 1 * * *", UTC = TR 04:00) — 90g okunmuş + 180g okunmamış sil');
+  console.log('  - lead_scores cleanup: cron("0 1 * * *", UTC = TR 04:00) — lead başına son 20 snapshot tut');
+  console.log('  - partner-calendar-sync: cron("*/10 * * * *", UTC) — agency_only tekneler freeBusy → boat_busy_slots');
 }
 
 export function stopCronScheduler(): void {
@@ -234,5 +333,7 @@ export function stopCronScheduler(): void {
   if (digestTask) { digestTask.stop(); digestTask = null; }
   if (opsDigestTask) { opsDigestTask.stop(); opsDigestTask = null; }
   if (opsEveningDigestTask) { opsEveningDigestTask.stop(); opsEveningDigestTask = null; }
+  if (notifCleanupTask) { notifCleanupTask.stop(); notifCleanupTask = null; }
+  if (partnerSyncTask) { partnerSyncTask.stop(); partnerSyncTask = null; }
   console.log('[cron-scheduler] stopped');
 }

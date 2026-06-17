@@ -124,6 +124,37 @@ export async function listCalendarEvents(opts: {
   return json.items ?? [];
 }
 
+/**
+ * freeBusy.query — takvimin dolu aralıklarını döner (event detayı YOK).
+ * "Yalnızca müsait/meşgul" paylaşımıyla bile çalışır; partner tekne sync'i bunu kullanır.
+ */
+export async function freeBusyQuery(opts: {
+  accessToken: string;
+  calendarId: string;
+  timeMin: string;
+  timeMax: string;
+  timeZone?: string;
+}): Promise<Array<{ start: string; end: string }>> {
+  const r = await fetch(`${GOOGLE_CALENDAR_BASE}/freeBusy`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${opts.accessToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      timeMin: opts.timeMin,
+      timeMax: opts.timeMax,
+      timeZone: opts.timeZone ?? 'Europe/Istanbul',
+      items: [{ id: opts.calendarId }],
+    }),
+  });
+  if (!r.ok) throw new Error(`freeBusy failed: ${r.status} ${await r.text()}`);
+  const json = await r.json() as {
+    calendars?: Record<string, { busy?: Array<{ start: string; end: string }>; errors?: unknown[] }>;
+  };
+  // 'primary' isteğinde yanıt key'i gerçek takvim ID'siyle dönebilir
+  const cal = json.calendars?.[opts.calendarId] ?? Object.values(json.calendars ?? {})[0];
+  if (cal?.errors?.length) throw new Error(`freeBusy calendar error: ${JSON.stringify(cal.errors)}`);
+  return cal?.busy ?? [];
+}
+
 export interface NewCalendarEvent {
   summary: string;
   description?: string;

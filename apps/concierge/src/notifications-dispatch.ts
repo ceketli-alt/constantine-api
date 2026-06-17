@@ -69,6 +69,7 @@ function fmtDate(iso: unknown): string {
   const months = ['Ocak', 'Şubat', 'Mart', 'Nisan', 'Mayıs', 'Haziran',
                   'Temmuz', 'Ağustos', 'Eylül', 'Ekim', 'Kasım', 'Aralık']
   const [y, m, d] = iso.slice(0, 10).split('-')
+  if (!y || !m || !d) return iso
   return `${parseInt(d)} ${months[parseInt(m) - 1]} ${y}`
 }
 
