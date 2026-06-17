@@ -26,8 +26,12 @@ import { handleEmailSend } from './email-send.js';
 import { handleUnsubscribe } from './unsubscribe.js';
 import { handleReplyClassify } from './reply-classify.js';
 import { handleReplyDraft } from './reply-draft.js';
+import { handleGenerateIcebreaker } from './icebreaker.js';
 import { handleIysCheck } from './iys-check.js';
 import { handleAgencyPanel } from './agency-panel.js';
+import { handleBoatOnboarding } from './boat-onboarding.js';
+import { handleAgencyForwardNotify } from './agency-forward-notify.js';
+import { handleEnrollLeads } from './sales-enrollment.js';
 import { startCampaignWorker, stopCampaignWorker } from './campaign-worker.js';
 import { startCronScheduler, stopCronScheduler } from './cron-scheduler.js';
 import { startMailcowReplyPoller, stopMailcowReplyPoller } from './mailcow-reply-poller.js';
@@ -38,8 +42,10 @@ import { handleDailyDigest } from './daily-digest.js';
 import { handleWpSend } from './wp-send.js';
 import { handleWpWebhook } from './wp-webhook.js';
 import { handleMailMetrics, handleMailHealth, handleMailEvents } from './mail-metrics.js';
+import { handleSettlementSnapshot, handleSettlementTransfer, handleSettlementTransferDelete } from './settlement.js';
 import { handleGoogleOAuthCallback } from './google-oauth.js';
 import { handleCalendarPull, handleCalendarPush, handleCalendarImport, handleCalendarBackfill } from './google-calendar.js';
+import { handlePartnerCalendarSync } from './partner-calendar-sync.js';
 import { sendTestEmail, sendEmail } from './resend-send.js';
 import {
   verifyAnyJWT,
@@ -297,12 +303,13 @@ app.post('/rest/v1/rpc/:fn', async (c) => {
 app.get('/functions/v1/', (c) => c.json({
   ports: [
     'email-send', 'email-inbound', 'email-webhook', 'reply-classify',
-    'iys-check', 'agency-panel',
+    'iys-check', 'agency-panel', 'enroll-leads',
     'cron-tick-warmup', 'cron-recompute-scores', 'cron-overdue', 'cron-recurring',
     'cron-daily-digest', 'daily-digest',
     'wp-send', 'wp-webhook',
     'gmail-oauth-callback', 'google-oauth-callback',
     'google-calendar-pull', 'google-calendar-push', 'google-calendar-import', 'google-calendar-backfill',
+    'partner-calendar-sync',
     'mail-metrics', 'mail-health', 'mail-events',
   ],
 }));
@@ -312,6 +319,53 @@ app.post('/functions/v1/email-webhook', (c) => handleResendWebhook(c));
 
 // Resend send — sales UI'ın ana send akışı (CampaignWizard, LeadEmailCompose, ReplyComposer)
 app.post('/functions/v1/email-send', (c) => handleEmailSend(c));
+
+// Admin: kullanıcı şifresini sıfırla (sadece super_admin) — Settings → StaffPanel'den
+// çağrılır. Yeni şifre Argon2 hash'lenip auth.users.password_hash'e yazılır.
+// Audit: activity_events.event_type = 'admin_password_reset' (category=critical).
+app.post('/functions/v1/admin-set-password', async (c) => {
+  const auth = requireAuth(c);
+  if (!auth?.userId) return c.json({ error: 'unauthorized' }, 401);
+  const callerProf = await sql`SELECT role::text AS role FROM profiles WHERE id = ${auth.userId} LIMIT 1`;
+  if (callerProf[0]?.role !== 'super_admin') {
+    return c.json({ error: 'forbidden', detail: 'Sadece super_admin şifre sıfırlayabilir' }, 403);
+  }
+
+  let body: any;
+  try { body = await c.req.json(); } catch { return c.json({ error: 'invalid_json' }, 400); }
+  const userId: string | undefined = body?.user_id;
+  const newPassword: string | undefined = body?.new_password;
+  if (!userId || typeof userId !== 'string') {
+    return c.json({ error: 'invalid_request', detail: 'user_id gerekli' }, 400);
+  }
+  if (!newPassword || typeof newPassword !== 'string' || newPassword.length < 6) {
+    return c.json({ error: 'invalid_request', detail: 'new_password en az 6 karakter olmalı' }, 400);
+  }
+
+  const target = await sql<Array<{ id: string; email: string }>>`
+    SELECT id, email FROM auth.users WHERE id = ${userId} LIMIT 1
+  `;
+  if (!target[0]) return c.json({ error: 'user_not_found' }, 404);
+
+  try {
+    await setUserPassword(userId, newPassword);
+    try {
+      await sql`
+        INSERT INTO activity_events (user_id, event_type, category, points, target_type, target_id, metadata)
+        VALUES (
+          ${auth.userId}::uuid, 'admin_password_reset', 'critical', 0, 'profile', ${userId}::uuid,
+          ${sql.json({ target_email: target[0].email, source: 'admin_panel' })}
+        )
+      `;
+    } catch (e: any) {
+      console.warn('[admin-set-password] audit insert skipped:', e?.message);
+    }
+    return c.json({ ok: true, user_id: userId, email: target[0].email });
+  } catch (e: any) {
+    console.error('[admin-set-password] failed:', e);
+    return c.json({ error: 'internal_error', message: e?.message ?? 'unknown' }, 500);
+  }
+});
 
 // Unsubscribe — RFC 8058 one-click (POST, mail sağlayıcısı) + footer linki (GET, insan). Auth YOK (tokenli).
 app.get('/functions/v1/unsubscribe', (c) => handleUnsubscribe(c));
@@ -326,12 +380,24 @@ app.post('/functions/v1/reply-classify', (c) => handleReplyClassify(c));
 // Reply draft — inbound yanıta Claude ile yanıt taslağı üret (human-in-the-loop, GÖNDERMEZ)
 app.post('/functions/v1/reply-draft', (c) => handleReplyDraft(c));
 
+// Generate icebreaker — lead başına AI kişiselleştirilmiş açılış cümlesi (custom_fields.ai_icebreaker)
+app.post('/functions/v1/generate-icebreaker', (c) => handleGenerateIcebreaker(c));
+
 // İYS check — opt-out registry kontrolü (stub mode + 30-gün cache)
 app.post('/functions/v1/iys-check', (c) => handleIysCheck(c));
+
+app.post('/functions/v1/enroll-leads', (c) => handleEnrollLeads(c));
 
 // Agency panel — token-bazlı public view (acente paneli)
 app.get('/functions/v1/agency-panel', (c) => handleAgencyPanel(c));
 app.post('/functions/v1/agency-panel', (c) => handleAgencyPanel(c));
+
+// Self-service kaptan onboarding (v4) — invite(admin)/validate/submit/upload-photo/publish(admin)/submissions(admin)
+app.get('/functions/v1/boat-onboarding', (c) => handleBoatOnboarding(c));
+app.post('/functions/v1/boat-onboarding', (c) => handleBoatOnboarding(c));
+
+// Partner talebini tekneciye yönlendirme maili (admin, super_admin/partner)
+app.post('/functions/v1/agency-forward-notify', (c) => handleAgencyForwardNotify(c));
 
 // Cron jobs (manuel tetikleme için endpoint, scheduler aynı zamanda otomatik çalıştırır)
 app.post('/functions/v1/cron-tick-warmup', (c) => handleWarmupTick(c));
@@ -365,6 +431,14 @@ app.post('/functions/v1/google-calendar-pull', (c) => handleCalendarPull(c));
 app.post('/functions/v1/google-calendar-push', (c) => handleCalendarPush(c));
 app.post('/functions/v1/google-calendar-import', (c) => handleCalendarImport(c));
 app.post('/functions/v1/google-calendar-backfill', (c) => handleCalendarBackfill(c));
+
+// Partner tekne takvim senkronu — manuel tetik (cron 10dk'da bir otomatik koşar)
+app.post('/functions/v1/partner-calendar-sync', (c) => handlePartnerCalendarSync(c));
+
+// Settlement (Hesaplaşma) — CONSTANTINE teknesi için ortak hesap kitap
+app.post('/functions/v1/settlement-snapshot', (c) => handleSettlementSnapshot(c));
+app.post('/functions/v1/settlement-transfer', (c) => handleSettlementTransfer(c));
+app.delete('/functions/v1/settlement-transfer/:id', (c) => handleSettlementTransferDelete(c));
 
 // Test mail at — auth'la korumalı, sadece super_admin
 app.post('/functions/v1/email-test', async (c) => {

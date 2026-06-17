@@ -172,6 +172,25 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** body_html boş + body_text dolu durumlarda kullanılır. HTML escape + URL linkify +
+ *  paragraph split (boş satırla) → `<p>` + tekil newline → `<br>`. Footer sonra eklenir. */
+function textToBasicHtml(text: string): string {
+  const escaped = text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+  const linkified = escaped.replace(
+    /(https?:\/\/[^\s<]+)/g,
+    '<a href="$1" target="_blank" rel="noopener noreferrer" style="color:#2563eb">$1</a>',
+  );
+  return linkified
+    .split(/\n\s*\n+/)
+    .map((p) => `<p style="margin:0 0 12px 0;line-height:1.5;color:#222">${p.trim().replace(/\n/g, '<br>')}</p>`)
+    .join('\n');
+}
+
 function sanitizeBodyHtml(html: string): string {
   if (!html) return html;
   return sanitizeHtml(html, HTML_SANITIZE_OPTS);
@@ -260,7 +279,7 @@ export async function sendEmailCore(
         // ─── 1. Lead fetch ───────────────────────────────────────────
         const leadRows = await tx`
           SELECT id, primary_contact_email, primary_contact_name, company_name,
-                 status, source_meta
+                 status, source_meta, custom_fields, email_thread_id
           FROM leads
           WHERE id = ${input.lead_id}
         `;
@@ -349,7 +368,17 @@ export async function sendEmailCore(
 
         const senderEmail = input.sender_email ?? DEFAULT_SENDER_EMAIL;
         const senderName = input.sender_name ?? DEFAULT_SENDER_NAME;
-        const replyTo = input.reply_to ?? DEFAULT_REPLY_TO;
+        // Reply-To stratejisi (2026-06-10):
+        //  - Cold outreach (campaign_id var) → sender'ın kendisi (sticky pool seçimi)
+        //    → mailcow-reply-poller cy.online mailbox'larından okur
+        //  - Manuel mail sender_email override'lı (Lead Detail Modal'dan kişisel adres)
+        //    → Reply-To = sender, müşteri kişisel kutuya yazar
+        //  - Default sender (noreply@send.cy.com) → DEFAULT_REPLY_TO=info@cy.com
+        //    → info-poller (INFO_IMAP_*) cy.com IMAP'tan okur
+        // Hepsinde input.reply_to override öncelikli (per-target ileride lazım olursa).
+        const senderOverridden = input.sender_email != null;
+        const isOutreach = input.campaign_id != null;
+        const replyTo = input.reply_to ?? ((senderOverridden || isOutreach) ? senderEmail : DEFAULT_REPLY_TO);
 
         if (input.template_id) {
           const tplRows = await tx`
@@ -372,10 +401,15 @@ export async function sendEmailCore(
               ? (String(lead.primary_contact_name).trim().split(/\s+/)[0] ?? '')
               : '');
 
+          // G6 — AI icebreaker: lead.custom_fields.ai_icebreaker (pre-generate edilmiş) → {{ai_icebreaker}}
+          const aiIcebreaker: string = input.variables?.ai_icebreaker
+            ?? (typeof (lead.custom_fields as any)?.ai_icebreaker === 'string' ? (lead.custom_fields as any).ai_icebreaker : '');
+
           const vars: Record<string, string> = {
             ...(input.variables ?? {}),
             company_name: lead.company_name ?? '',
             primary_contact_name: lead.primary_contact_name ?? '',
+            ai_icebreaker: aiIcebreaker,
             sender_first_name: senderFirst,
             sender_full_name: senderName,
             agency_name: lead.company_name ?? '',
@@ -412,33 +446,58 @@ export async function sendEmailCore(
           return { success: false, error: 'subject ve body_html/body_text gerekli', status: 400 };
         }
 
-        // ─── 5. Threading ────────────────────────────────────────────
-        const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString();
-        const existingThreadRows = await tx`
-          SELECT id, message_count
-          FROM email_threads
-          WHERE lead_id = ${lead.id}
-            AND subject = ${subject}
-            AND last_message_at >= ${thirtyDaysAgo}
-          ORDER BY last_message_at DESC
-          LIMIT 1
-        `;
+        // ─── Fallback: body_html boş + body_text dolu → text'ten basic HTML üret ─
+        // VIP 2026-06-10: campaign_targets.body_text_override doluyken body_html boş
+        // kalmıştı, HTML render eden mail client'lar sadece footer gördü.
+        if (!bodyHtml.trim() && bodyText.trim()) {
+          bodyHtml = textToBasicHtml(bodyText);
+        }
 
+        // ─── 5. Threading ────────────────────────────────────────────
+        // Tek-thread-per-lead: lead'in mevcut (canonical) thread'i varsa onu kullan.
+        // Eskiden subject-EXACT match yapılıyordu → aynı lead'e farklı konudan giden
+        // her mail (ör. VIP + "[Tekrar]" apology) AYRI thread açıyordu, inbox fragmente
+        // oluyor + gelen reply doğru konuşmaya bağlanamıyordu. Artık lead.email_thread_id
+        // reuse edilir; yoksa (ilk mail) subject+30g fallback, o da yoksa yeni thread.
         let threadId: string;
         let prevMessageCount = 0;
-        if (existingThreadRows[0]) {
-          threadId = existingThreadRows[0].id;
-          prevMessageCount = Number(existingThreadRows[0].message_count ?? 0);
+
+        const reuseThreadRows = lead.email_thread_id
+          ? await tx`
+              SELECT id, message_count FROM email_threads
+              WHERE id = ${lead.email_thread_id}
+              LIMIT 1
+            `
+          : [];
+
+        if (reuseThreadRows[0]) {
+          threadId = reuseThreadRows[0].id;
+          prevMessageCount = Number(reuseThreadRows[0].message_count ?? 0);
         } else {
-          const newThreadRows = await tx`
-            INSERT INTO email_threads (lead_id, subject, message_count, status)
-            VALUES (${lead.id}, ${subject}, 0, 'open')
-            RETURNING id
+          const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString();
+          const existingThreadRows = await tx`
+            SELECT id, message_count
+            FROM email_threads
+            WHERE lead_id = ${lead.id}
+              AND subject = ${subject}
+              AND last_message_at >= ${thirtyDaysAgo}
+            ORDER BY last_message_at DESC
+            LIMIT 1
           `;
-          if (!newThreadRows[0]) {
-            return { success: false, error: 'Thread oluşturulamadı', status: 500 };
+          if (existingThreadRows[0]) {
+            threadId = existingThreadRows[0].id;
+            prevMessageCount = Number(existingThreadRows[0].message_count ?? 0);
+          } else {
+            const newThreadRows = await tx`
+              INSERT INTO email_threads (lead_id, subject, message_count, status)
+              VALUES (${lead.id}, ${subject}, 0, 'open')
+              RETURNING id
+            `;
+            if (!newThreadRows[0]) {
+              return { success: false, error: 'Thread oluşturulamadı', status: 500 };
+            }
+            threadId = newThreadRows[0].id;
           }
-          threadId = newThreadRows[0].id;
         }
 
         // ─── 6. Sanitize + Footer + unsubscribe URL ─────────────────

@@ -204,6 +204,10 @@ interface TargetRow {
   id: string;
   lead_id: string;
   variant: string | null;
+  // Per-target override (Agent Day 2026-06-04 follow-up için 2026-06-08'de eklendi).
+  // Doluysa template render atlanır, sendEmailCore raw subject+body kullanır.
+  subject_override: string | null;
+  body_text_override: string | null;
 }
 
 const DAY_MS = 86_400_000;
@@ -323,13 +327,18 @@ async function processInitials(
   budget: number,
   ctxUserId: string,
 ): Promise<number> {
+  // scheduled_at (opsiyonel) doluysa erkenden gönderme: VIP batch'lerde lead başına
+  // elden zaman ataması için (Agent Day 2026-06-04 follow-up, 10-12 Haz 30 dk aralıkla).
+  // NULL bırakılırsa eski davranış (FIFO + throttle aralığı) korunur.
   const queuedRows: Array<TargetRow & { primary_contact_email: string | null; source_meta: any }> = await sql`
-    SELECT ct.id, ct.lead_id, ct.variant, l.primary_contact_email, l.source_meta
+    SELECT ct.id, ct.lead_id, ct.variant, ct.subject_override, ct.body_text_override,
+           l.primary_contact_email, l.source_meta
     FROM campaign_targets ct
     JOIN leads l ON l.id = ct.lead_id
     WHERE ct.campaign_id = ${campaign.id}
       AND ct.status = 'queued'
-    ORDER BY ct.created_at
+      AND (ct.scheduled_at IS NULL OR ct.scheduled_at <= now())
+    ORDER BY COALESCE(ct.scheduled_at, ct.created_at)
     LIMIT ${budget}
   `;
   if (queuedRows.length === 0) return 0;
@@ -368,10 +377,16 @@ async function processInitials(
       continue;
     }
 
+    // Per-target override: doluysa template render atlanır, raw subject+body kullanılır.
+    // Agent Day 2026-06-04 follow-up gibi her lead'in farklı kişiselleştirilmiş içeriği
+    // olduğu VIP batch'lerde kullanılır.
+    const hasOverride = !!(target.body_text_override && target.body_text_override.trim());
     const result = await sendEmailCore(
       {
         lead_id: target.lead_id,
-        template_id: campaign.template_id ?? undefined,
+        template_id: hasOverride ? undefined : (campaign.template_id ?? undefined),
+        subject: hasOverride ? (target.subject_override ?? undefined) : undefined,
+        body_text: hasOverride ? (target.body_text_override ?? undefined) : undefined,
         sender_email: pickSender(campaign, target.lead_id),
         campaign_id: campaign.id,
         override_to_email: overrideTo,

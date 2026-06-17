@@ -170,11 +170,16 @@ export async function processInboundEmail(input: InboundEmailInput): Promise<Inb
       }
     }
 
-    // 1. Lead lookup
+    // 1. Lead lookup — aynı e-posta birden çok lead'de olabilir (primary_contact_email
+    //    UNIQUE değil, ~19 grup dup var). Deterministik seç: AKTİF çalışılan lead'i
+    //    tercih et (en son mail atılan + thread'i olan), keyfi pick değil.
     const leadRows = await sql`
       SELECT id, company_name, email_thread_id
       FROM leads
       WHERE lower(primary_contact_email) = ${fromEmail}
+      ORDER BY last_contacted_at DESC NULLS LAST,
+               (email_thread_id IS NOT NULL) DESC,
+               created_at ASC
       LIMIT 1
     `;
     const lead = leadRows[0];
@@ -211,21 +216,58 @@ export async function processInboundEmail(input: InboundEmailInput): Promise<Inb
     }
 
     if (!threadId) {
-      // Subject normalize fallback (RE:/FW:/YN: strip, son 30 gün)
-      const normalized = String(subject).replace(/^(re|fw|fwd|yn|i?lt):\s*/gi, '').trim();
+      // Subject normalize fallback — tekrarlı/çok-dilli prefix'leri (RE:/FW:/FWD:/
+      // YN:/YNT:/İLT: Türkçe Yanıt/İlet + "[Tekrar]" gibi) ve köşeli-parantez
+      // etiketlerini sıyır, son 30 gün lead thread'lerinde ILIKE ara.
+      // (Önceki regex "YNT:" yakalamıyordu → Kezban reply'ı yeni thread açmıştı.)
+      let normalized = String(subject);
+      let prev = '';
+      while (prev !== normalized) {
+        prev = normalized;
+        normalized = normalized
+          .replace(/^\s*(re|fw|fwd|yn|ynt|ilt|i̇lt|aw|sv|vs)\s*:\s*/i, '')
+          .replace(/^\s*\[[^\]]*\]\s*/, '') // [Tekrar], [EXTERNAL] vb.
+          .trim();
+      }
       const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
-      const rows = await sql`
-        SELECT id FROM email_threads
-        WHERE lead_id = ${lead.id}
-          AND subject ILIKE ${'%' + normalized + '%'}
-          AND last_message_at >= ${since}
-        ORDER BY last_message_at DESC
-        LIMIT 1
-      `;
-      if (rows[0]) threadId = rows[0].id;
+      if (normalized) {
+        const rows = await sql`
+          SELECT id FROM email_threads
+          WHERE lead_id = ${lead.id}
+            AND subject ILIKE ${'%' + normalized + '%'}
+            AND last_message_at >= ${since}
+          ORDER BY last_message_at DESC
+          LIMIT 1
+        `;
+        if (rows[0]) threadId = rows[0].id;
+      }
     }
 
-    // 3. Yeni thread (yoksa)
+    if (!threadId && !autoReply) {
+      // Lead-bazlı fallback — header/subject hiçbiri tutmadıysa reply'ı yeni bir
+      // ORPHAN thread'e atmak yerine lead'in mevcut konuşma thread'ine bağla.
+      // Önce canonical (leads.email_thread_id), yoksa lead'in en güncel thread'i.
+      // Threading'in kırık kaldığı durumlarda bile reply doğru konuşmaya düşer.
+      // !autoReply: OOO/otomatik-yanıt canonical thread'i kirletmesin + 'hot'
+      // classification'ı 'irrelevant' ile ezmesin (kendi orphan thread'ine düşsün).
+      if (lead.email_thread_id) {
+        const rows = await sql`
+          SELECT id FROM email_threads WHERE id = ${lead.email_thread_id} LIMIT 1
+        `;
+        if (rows[0]) threadId = rows[0].id;
+      }
+      if (!threadId) {
+        const rows = await sql`
+          SELECT id FROM email_threads
+          WHERE lead_id = ${lead.id}
+          ORDER BY last_message_at DESC NULLS LAST
+          LIMIT 1
+        `;
+        if (rows[0]) threadId = rows[0].id;
+      }
+    }
+
+    // 3. Yeni thread (yoksa — lead'in hiç thread'i yoksa, ör. ilk temas inbound)
     if (!threadId) {
       const newThreadRows = await sql`
         INSERT INTO email_threads (

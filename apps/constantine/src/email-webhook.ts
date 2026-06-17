@@ -89,9 +89,27 @@ export async function handleResendWebhook(c: Context): Promise<Response> {
   try {
     // email_messages'ta resend_message_id eşleşeni bul
     let messageId: string | null = null;
+    let lookupMethod = 'none';
     if (resendMessageId) {
       const m = await sql`SELECT id FROM email_messages WHERE resend_message_id = ${resendMessageId} LIMIT 1`;
       messageId = m[0]?.id ?? null;
+      if (messageId) lookupMethod = 'resend_id';
+    }
+    // Fallback 1: outbound recipient + son 7 gün (resend_id drift için)
+    if (!messageId && recipientEmail) {
+      const fb = await sql`
+        SELECT id FROM email_messages
+        WHERE direction='outbound'
+          AND lower(to_email) = lower(${recipientEmail})
+          AND sent_at > now() - interval '7 days'
+        ORDER BY sent_at DESC NULLS LAST
+        LIMIT 1
+      `;
+      if (fb[0]?.id) {
+        messageId = fb[0].id;
+        lookupMethod = 'recipient+date';
+        console.log(`[email-webhook] resend_id=${resendMessageId} eşleşmedi → recipient+date ile fallback bulundu: ${messageId} (${recipientEmail})`);
+      }
     }
 
     if (messageId && (PERSISTED_EVENT_TYPES as readonly string[]).includes(eventType)) {
@@ -111,7 +129,7 @@ export async function handleResendWebhook(c: Context): Promise<Response> {
         await sql.unsafe(`UPDATE email_messages SET ${stampCol} = now() WHERE id = $1`, [messageId]);
       }
     } else if (!messageId) {
-      console.log(`[email-webhook] message_id eşleşmedi (resend_id=${resendMessageId}), event drop`);
+      console.log(`[email-webhook] message_id eşleşmedi (resend_id=${resendMessageId}, recipient=${recipientEmail}, type=${eventType}, lookup=${lookupMethod}), event drop`);
     } else {
       // Enum dışı tip (sent/delivery_delayed/failed/unknown): kaydetmeden ack — cast hatası önlenir.
       // (bounced/complained PERSISTED'da → yukarıda kaydedilir; suppression aşağıda yine çalışır.)
@@ -165,7 +183,7 @@ export async function handleResendWebhook(c: Context): Promise<Response> {
       }
     }
 
-    return c.json({ ok: true, event: eventType, messageId, resendMessageId });
+    return c.json({ ok: true, event: eventType, messageId, resendMessageId, lookupMethod });
   } catch (e: any) {
     console.error('[email-webhook] DB error:', e.message);
     return c.json({ error: 'db_error', message: e.message }, 500);

@@ -31,8 +31,28 @@ Aşağıdaki müşteri yanıtını şu kategorilerden BİRİNE ata ve kısa bir 
 - opt_out: Listeden çıkmak istiyor (KVKK). Örnek: "Mail göndermeyin", "Abonelik iptali", "Beni listeden çıkarın"
 - irrelevant: OOO, autoreply, alakasız, robot yanıt. Örnek: "Out of office", "Bu adres pasif", spam-like
 
-Çıktı SADECE JSON:
-{ "classification": "<kategori>", "confidence": 0.0-1.0, "reasoning": "<1 cümle Türkçe>" }`;
+Sınıflandırmayı her zaman classify_reply aracını çağırarak döndür.`;
+
+// Structured output — Claude JSON string yerine tool parametresi üretir → SDK
+// garantili-valid obje döner. reasoning içindeki tırnak/alıntı artık JSON'u bozmaz
+// (eski text+JSON.parse yaklaşımı "position 98" parse hatası veriyordu).
+const CLASSIFY_TOOL: Anthropic.Tool = {
+  name: 'classify_reply',
+  description: 'Müşteri mail yanıtını 6 kategoriden birine sınıflandırır.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      classification: {
+        type: 'string',
+        enum: ['hot', 'warm', 'cold', 'objection', 'opt_out', 'irrelevant'],
+        description: 'Yanıt kategorisi',
+      },
+      confidence: { type: 'number', description: '0.0-1.0 arası güven skoru' },
+      reasoning: { type: 'string', description: '1 cümle Türkçe gerekçe' },
+    },
+    required: ['classification', 'confidence', 'reasoning'],
+  },
+};
 
 export interface ClassifyRequest {
   thread_id?: string;
@@ -90,28 +110,44 @@ export async function runReplyClassify(input: ClassifyRequest): Promise<RunReply
 
     // 2. Claude classify
     const client = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
-    let classification: ClassifyResult;
-    try {
+
+    // msg.subject narrowing'ini nested closure'a taşımadan önce sabitle (TS18048).
+    const userContent = `Subject: ${msg.subject}\n\nBody:\n${rawText}`;
+
+    // Tek sınıflandırma denemesi — tool use ile garantili-valid structured output.
+    async function classifyOnce(): Promise<ClassifyResult> {
       const response = await client.messages.create({
         model: ANTHROPIC_MODEL,
-        max_tokens: 200,
+        max_tokens: 600,
         temperature: 0.2,
         system: SYSTEM_PROMPT,
+        tools: [CLASSIFY_TOOL],
+        tool_choice: { type: 'tool', name: 'classify_reply' },
         messages: [
           {
             role: 'user',
-            content: `Subject: ${msg.subject}\n\nBody:\n${rawText}`,
+            content: userContent,
           },
         ],
       });
-      const block = response.content.find((b) => b.type === 'text');
-      const text = block && 'text' in block ? block.text.trim() : '';
-      // Claude bazen markdown code fence'lı dönebilir — sadece JSON çıkar
-      const jsonMatch = text.match(/\{[\s\S]*\}/);
-      const jsonStr = jsonMatch ? jsonMatch[0] : text;
-      classification = JSON.parse(jsonStr) as ClassifyResult;
+      const toolBlock = response.content.find((b) => b.type === 'tool_use');
+      if (!toolBlock || !('input' in toolBlock)) {
+        throw new Error('classify_reply tool_use block dönmedi');
+      }
+      return toolBlock.input as ClassifyResult;
+    }
+
+    let classification: ClassifyResult;
+    try {
+      // İlk deneme parse/transient hatası verirse 1 kez daha dene (idempotent — sadece okuma).
+      try {
+        classification = await classifyOnce();
+      } catch (firstErr: any) {
+        console.warn('[reply-classify] ilk deneme başarısız, retry:', firstErr?.message);
+        classification = await classifyOnce();
+      }
     } catch (e: any) {
-      console.error('[reply-classify] Claude error:', e?.message);
+      console.error('[reply-classify] Claude error (2 deneme sonrası):', e?.message);
       return { ok: false, status: 500, error: 'Claude API hatası', detail: e?.message };
     }
 
@@ -154,11 +190,229 @@ export async function runReplyClassify(input: ClassifyRequest): Promise<RunReply
           WHERE id = ${leadId}
         `;
       } else if (newTemp) {
+        // Lead snapshot (deal_id + status — Faz B kararları için)
+        const leadRows = await sql<Array<{ deal_id: string | null; status: string; company_name: string | null; primary_contact_name: string | null }>>`
+          SELECT deal_id, status::text AS status, company_name, primary_contact_name
+          FROM leads WHERE id = ${leadId}
+        `;
+        const lead = leadRows[0];
+
         await sql`
           UPDATE leads
           SET temperature = ${newTemp}::lead_temperature
           WHERE id = ${leadId}
         `;
+
+        // ─── Faz B1 — Hot reply → auto-deal ─────────────────────────
+        // Koşullar: classification='hot' + lead.deal_id IS NULL + thread'in son outbound
+        // campaign'ı auto_create_deal_on_hot_reply=true. Idempotent: deal_id guard.
+        if (classification.classification === 'hot' && lead && lead.deal_id == null) {
+          try {
+            type CampRow = {
+              campaign_id: string;
+              campaign_name: string | null;
+              auto_create_deal_on_hot_reply: boolean;
+              auto_deal_min_confidence: number;
+              created_by: string | null;
+            };
+
+            // 1) Önce thread-bazlı: reply'ın thread'inde campaign'li outbound var mı?
+            //    (Threading düzgün çalıştığında en kesin atıf budur.)
+            const threadCampRows = await sql<Array<CampRow>>`
+              SELECT em.campaign_id,
+                     c.name                            AS campaign_name,
+                     c.auto_create_deal_on_hot_reply,
+                     c.auto_deal_min_confidence,
+                     c.created_by
+              FROM email_messages em
+              LEFT JOIN campaigns c ON c.id = em.campaign_id
+              WHERE em.thread_id = ${msg.thread_id}
+                AND em.direction = 'outbound'
+                AND em.campaign_id IS NOT NULL
+              ORDER BY em.sent_at DESC NULLS LAST
+              LIMIT 1
+            `;
+            let camp = threadCampRows[0];
+
+            // 2) Lead-bazlı fallback: reply yeni/ayrı bir thread'e düştüyse (Mailcow
+            //    threading kırık — outbound message_id_header NULL, in_reply_to eşleşmiyor),
+            //    thread'de campaign bulunmaz. campaign_targets.replied zaten lead-bazlı
+            //    set ediliyor; auto-deal de aynı kaynağı kullansın: lead'in EN SON mail
+            //    aldığı kampanya.
+            if (!camp) {
+              const leadCampRows = await sql<Array<CampRow>>`
+                SELECT ct.campaign_id,
+                       c.name                            AS campaign_name,
+                       c.auto_create_deal_on_hot_reply,
+                       c.auto_deal_min_confidence,
+                       c.created_by
+                FROM campaign_targets ct
+                JOIN campaigns c ON c.id = ct.campaign_id
+                WHERE ct.lead_id = ${leadId}
+                  AND ct.sent_at IS NOT NULL
+                ORDER BY ct.sent_at DESC NULLS LAST, ct.created_at DESC
+                LIMIT 1
+              `;
+              camp = leadCampRows[0];
+              if (camp) {
+                console.log(`[reply-classify] auto-deal: thread'de campaign yok, lead-bazlı fallback → campaign=${camp.campaign_id} (lead=${leadId})`);
+              }
+            }
+
+            // D2 — confidence guard: Claude eşik altındaysa deal AÇILMAZ (temperature yine güncellendi).
+            const minConf = Number(camp?.auto_deal_min_confidence ?? 0.7);
+            const replyConf = Number(classification.confidence ?? 0);
+            const confidencePass = replyConf >= minConf;
+            if (camp && camp.auto_create_deal_on_hot_reply === true && !confidencePass) {
+              console.log(`[reply-classify] auto-deal skipped: confidence ${replyConf.toFixed(2)} < threshold ${minConf.toFixed(2)} (campaign=${camp.campaign_id})`);
+              try {
+                const adminId =
+                  camp.created_by ??
+                  (await sql<Array<{ id: string }>>`
+                    SELECT id FROM profiles WHERE role = 'super_admin' AND active = true
+                    ORDER BY created_at LIMIT 1
+                  `)[0]?.id;
+                if (adminId) {
+                  await sql`
+                    INSERT INTO activity_events (user_id, event_type, category, points, target_type, target_id, metadata)
+                    VALUES (
+                      ${adminId}::uuid,
+                      'deal_auto_skipped_low_confidence',
+                      'standard',
+                      0,
+                      'lead',
+                      ${leadId}::uuid,
+                      ${sql.json({
+                        campaign_id: camp.campaign_id,
+                        campaign_name: camp.campaign_name,
+                        confidence: replyConf,
+                        threshold: minConf,
+                        reasoning: classification.reasoning,
+                        reply_message_id: input.message_id,
+                        thread_id: msg.thread_id,
+                      })}
+                    )
+                  `;
+                }
+              } catch (e: any) {
+                console.warn('[reply-classify] skip-event insert failed:', e?.message);
+              }
+            }
+
+            if (camp && camp.auto_create_deal_on_hot_reply === true && confidencePass) {
+              const stageRows = await sql<Array<{ id: string }>>`
+                SELECT id FROM deal_stages WHERE slug = 'qualified' LIMIT 1
+              `;
+              const stageId = stageRows[0]?.id ?? null;
+
+              if (stageId) {
+                const displayName = lead.company_name ?? lead.primary_contact_name ?? 'Lead';
+                const title = `${displayName} — ${camp.campaign_name ?? 'Reply'}`;
+                const notes = `Otomatik: "${camp.campaign_name ?? 'kampanya'}" kampanyasında 'hot' reply. Subject: ${msg.subject ?? ''}`;
+
+                const dealRows = await sql<Array<{ id: string }>>`
+                  INSERT INTO deals (lead_id, title, stage_id, probability, owner_id, source_channel, notes)
+                  VALUES (
+                    ${leadId}::uuid,
+                    ${title},
+                    ${stageId}::uuid,
+                    35,
+                    ${camp.created_by}::uuid,
+                    'email'::contact_channel,
+                    ${notes}
+                  )
+                  RETURNING id
+                `;
+                const dealId = dealRows[0]?.id ?? null;
+
+                if (dealId) {
+                  await sql`
+                    UPDATE leads
+                    SET deal_id = ${dealId}::uuid,
+                        status  = 'qualified'
+                    WHERE id = ${leadId}
+                  `;
+
+                  // activity_events: deal_auto_created
+                  try {
+                    const adminId =
+                      camp.created_by ??
+                      (await sql<Array<{ id: string }>>`
+                        SELECT id FROM profiles WHERE role = 'super_admin' AND active = true
+                        ORDER BY created_at LIMIT 1
+                      `)[0]?.id;
+                    if (adminId) {
+                      await sql`
+                        INSERT INTO activity_events (user_id, event_type, category, points, target_type, target_id, metadata)
+                        VALUES (
+                          ${adminId}::uuid,
+                          'deal_auto_created',
+                          'standard',
+                          0,
+                          'deal',
+                          ${dealId}::uuid,
+                          ${sql.json({
+                            campaign_id: camp.campaign_id,
+                            campaign_name: camp.campaign_name,
+                            lead_id: leadId,
+                            temperature: 'hot',
+                            confidence: replyConf,
+                            threshold: minConf,
+                            reply_message_id: input.message_id,
+                            thread_id: msg.thread_id,
+                          })}
+                        )
+                      `;
+                    }
+                  } catch (e: any) {
+                    console.warn('[reply-classify] deal_auto_created activity skipped:', e.message);
+                  }
+                }
+              } else {
+                console.warn('[reply-classify] auto-deal: qualified stage bulunamadı');
+              }
+            }
+          } catch (e: any) {
+            // Auto-deal başarısız olsa da temperature update commit kalır
+            console.error('[reply-classify] auto-deal create FAILED (non-fatal):', e?.message);
+          }
+        }
+
+        // ─── Faz B2 — Warm reply → status='in_dialogue' ─────────────
+        // Koşul: classification='warm' + lead.status='contacted' (henüz qualified+ olmadıysa)
+        else if (classification.classification === 'warm' && lead && lead.status === 'contacted') {
+          try {
+            await sql`
+              UPDATE leads SET status = 'in_dialogue' WHERE id = ${leadId}
+            `;
+            const adminId = (await sql<Array<{ id: string }>>`
+              SELECT id FROM profiles WHERE role = 'super_admin' AND active = true
+              ORDER BY created_at LIMIT 1
+            `)[0]?.id;
+            if (adminId) {
+              await sql`
+                INSERT INTO activity_events (user_id, event_type, category, points, target_type, target_id, metadata)
+                VALUES (
+                  ${adminId}::uuid,
+                  'lead_status_changed',
+                  'standard',
+                  0,
+                  'lead',
+                  ${leadId}::uuid,
+                  ${sql.json({
+                    from: 'contacted',
+                    to: 'in_dialogue',
+                    reason: 'warm_reply',
+                    message_id: input.message_id,
+                    thread_id: msg.thread_id,
+                  })}
+                )
+              `;
+            }
+          } catch (e: any) {
+            console.warn('[reply-classify] in_dialogue transition skipped:', e?.message);
+          }
+        }
       }
 
       // 5. opt_out → unsubscribes upsert + thread closed
