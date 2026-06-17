@@ -7,3 +7,6 @@ dist/
 **/dist/
 *.log
 .DS_Store
+
+# Playwright tarayıcı binaryleri — runtime gerekli, repoya girmemeli (641MB)
+.playwright-browsers/
