@@ -18,6 +18,7 @@ import { sql } from './db.js';
 import { runWarmupTick } from './cron-warmup-tick.js';
 import { runRecomputeScores } from './cron-recompute-scores.js';
 import { runSalesDailyDigest } from './cron-daily-digest.js';
+import { runWeeklyTrendDigest } from './cron-weekly-digest.js';
 import { runOpsDailyDigest } from './daily-digest.js';
 import { runPartnerCalendarSync } from './partner-calendar-sync.js';
 
@@ -26,6 +27,7 @@ let scoresTask: ScheduledTask | null = null;
 let overdueTask: ScheduledTask | null = null;
 let recurringTask: ScheduledTask | null = null;
 let digestTask: ScheduledTask | null = null;
+let weeklyTrendTask: ScheduledTask | null = null;
 let opsDigestTask: ScheduledTask | null = null;
 let opsEveningDigestTask: ScheduledTask | null = null;
 let notifCleanupTask: ScheduledTask | null = null;
@@ -146,6 +148,28 @@ async function safeRunSalesDigest(): Promise<void> {
   } catch (e: any) {
     console.error('[cron-scheduler] sales digest error:', e?.message);
     await writeLastRun('sales.cron.last_daily_digest', { error: e?.message ?? 'unknown' });
+  }
+}
+
+/** Weekly trend digest — TR Pazartesi 09:00 (yalnızca super_admin / Mert) */
+async function safeRunWeeklyTrendDigest(): Promise<void> {
+  if (!(await loadCronEnabled())) {
+    console.log('[cron-scheduler] cron disabled, weekly trend digest skipped');
+    return;
+  }
+  console.log('[cron-scheduler] running weekly trend digest...');
+  try {
+    const result = await runWeeklyTrendDigest();
+    console.log(`[cron-scheduler] weekly trend digest OK: sent=${result.sent} skipped=${result.skipped} errors=${result.errors.length}`);
+    await writeLastRun('sales.cron.last_weekly_trend_digest', {
+      sent: result.sent,
+      skipped: result.skipped,
+      errors: result.errors.length,
+      reason: result.reason,
+    });
+  } catch (e: any) {
+    console.error('[cron-scheduler] weekly trend digest error:', e?.message);
+    await writeLastRun('sales.cron.last_weekly_trend_digest', { error: e?.message ?? 'unknown' });
   }
 }
 
@@ -290,6 +314,11 @@ export function startCronScheduler(): void {
     safeRunSalesDigest().catch((e) => console.error('[cron-scheduler] sales digest unhandled:', e?.message));
   }, { timezone: 'UTC' });
 
+  // weekly trend digest: her Pazartesi 06:00 UTC (= TR 09:00) — yalnızca super_admin (Mert)
+  weeklyTrendTask = cron.schedule('0 6 * * 1', () => {
+    safeRunWeeklyTrendDigest().catch((e) => console.error('[cron-scheduler] weekly trend unhandled:', e?.message));
+  }, { timezone: 'UTC' });
+
   // ops daily digest — morning: 06:00 UTC = TR 09:00 sabah
   opsDigestTask = cron.schedule('0 6 * * *', () => {
     safeRunOpsDigest('morning').catch((e) => console.error('[cron-scheduler] ops morning unhandled:', e?.message));
@@ -318,6 +347,7 @@ export function startCronScheduler(): void {
   console.log('  - task-overdue: cron("0 0 * * *", UTC)');
   console.log('  - recurring (tasks+expenses): cron("0 0 * * *", UTC)');
   console.log('  - sales daily digest: cron("0 5 * * *", UTC = TR 08:00)');
+  console.log('  - weekly trend digest: cron("0 6 * * 1", UTC = TR Pazartesi 09:00, super_admin)');
   console.log('  - ops daily digest [morning]: cron("0 6 * * *", UTC = TR 09:00)');
   console.log('  - ops daily digest [evening]: cron("0 20 * * *", UTC = TR 23:00)');
   console.log('  - notifications cleanup: cron("0 1 * * *", UTC = TR 04:00) — 90g okunmuş + 180g okunmamış sil');
@@ -331,6 +361,7 @@ export function stopCronScheduler(): void {
   if (overdueTask) { overdueTask.stop(); overdueTask = null; }
   if (recurringTask) { recurringTask.stop(); recurringTask = null; }
   if (digestTask) { digestTask.stop(); digestTask = null; }
+  if (weeklyTrendTask) { weeklyTrendTask.stop(); weeklyTrendTask = null; }
   if (opsDigestTask) { opsDigestTask.stop(); opsDigestTask = null; }
   if (opsEveningDigestTask) { opsEveningDigestTask.stop(); opsEveningDigestTask = null; }
   if (notifCleanupTask) { notifCleanupTask.stop(); notifCleanupTask = null; }

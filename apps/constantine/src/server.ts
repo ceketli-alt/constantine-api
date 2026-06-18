@@ -38,6 +38,7 @@ import { startMailcowReplyPoller, stopMailcowReplyPoller } from './mailcow-reply
 import { handleWarmupTick } from './cron-warmup-tick.js';
 import { handleRecomputeScores } from './cron-recompute-scores.js';
 import { handleCronDailyDigest } from './cron-daily-digest.js';
+import { handleCronWeeklyDigest } from './cron-weekly-digest.js';
 import { handleDailyDigest } from './daily-digest.js';
 import { handleWpSend } from './wp-send.js';
 import { handleWpWebhook } from './wp-webhook.js';
@@ -305,7 +306,7 @@ app.get('/functions/v1/', (c) => c.json({
     'email-send', 'email-inbound', 'email-webhook', 'reply-classify',
     'iys-check', 'agency-panel', 'enroll-leads',
     'cron-tick-warmup', 'cron-recompute-scores', 'cron-overdue', 'cron-recurring',
-    'cron-daily-digest', 'daily-digest',
+    'cron-daily-digest', 'cron-weekly-digest', 'daily-digest',
     'wp-send', 'wp-webhook',
     'gmail-oauth-callback', 'google-oauth-callback',
     'google-calendar-pull', 'google-calendar-push', 'google-calendar-import', 'google-calendar-backfill',
@@ -405,6 +406,7 @@ app.post('/functions/v1/cron-recompute-scores', (c) => handleRecomputeScores(c))
 app.post('/functions/v1/cron-overdue', async (c) => c.json(await (await import('./cron-scheduler.js')).runOverdueTick()));
 app.post('/functions/v1/cron-recurring', async (c) => c.json(await (await import('./cron-scheduler.js')).runRecurringTick()));
 app.post('/functions/v1/cron-daily-digest', (c) => handleCronDailyDigest(c));
+app.post('/functions/v1/cron-weekly-digest', (c) => handleCronWeeklyDigest(c));
 
 // Operations daily digest (TR 09:00) — Gmail OAuth ile system_email_credentials üzerinden gönderim
 app.post('/functions/v1/daily-digest', (c) => handleDailyDigest(c));
