@@ -43,13 +43,63 @@ export interface DigestStaleLead {
   daysSinceContact: number;
 }
 
+// ── Yeni KPI blokları (2026-06-17) ──
+export interface DigestCampaignRow {
+  name: string;
+  sentToday: number;
+  repliesLast24h: number;
+  queued: number;
+}
+export interface DigestCampaignSummary {
+  campaigns: DigestCampaignRow[];
+  sentToday: number;
+  repliesLast24h: number;
+  newHotWarm24h: number;
+  replyRate7dPct: number | null; // null = yeterli veri yok
+  queuedTotal: number;
+}
+export interface DigestDeliverability {
+  bouncedToday: number;
+  complainedToday: number;
+  bounced7d: number;
+  complained7d: number;
+  delivered7d: number;
+  bounceRate7dPct: number | null;
+  queueRunwayDays: number | null;
+  status: 'healthy' | 'watch' | 'alert';
+}
+export interface DigestNewDeal {
+  id: string;
+  title: string;
+  valueTry: number | null;
+  auto: boolean;
+}
+export interface DigestUnansweredReply {
+  leadId: string;
+  leadName: string;
+  daysWaiting: number;
+}
+export interface DigestHotLeadNoDeal {
+  id: string;
+  name: string;
+  score: number | null;
+}
+
 export interface DigestInput {
   recipientName: string;
   todayLabel: string;
+  // çekirdek (mevcut)
   planned: DigestPlannedActivity[];
   hotLeads: DigestHotLead[];
   rottingDeals: DigestRottingDeal[];
   staleLeads: DigestStaleLead[];
+  // yeni bloklar (opsiyonel — yoksa render atlanır)
+  campaignSummary?: DigestCampaignSummary | null;
+  deliverability?: DigestDeliverability | null;
+  newDeals?: DigestNewDeal[];
+  unansweredReplies?: DigestUnansweredReply[];
+  overdueFollowups?: DigestPlannedActivity[];
+  hotLeadsNoDeal?: DigestHotLeadNoDeal[];
   appBaseUrl?: string;
 }
 
@@ -106,20 +156,22 @@ function kindLabel(kind: string): { tr: string; icon: string } {
 }
 
 function buildSubject(input: DigestInput): string {
+  const d = input.deliverability;
+  if (d && d.status === 'alert') return '⚠ Gönderim uyarısı — günlük satış özeti';
+  const cs = input.campaignSummary;
+  const unanswered = input.unansweredReplies?.length ?? 0;
+  if (cs && cs.repliesLast24h > 0) {
+    return `${cs.repliesLast24h} yeni yanıt${unanswered > 0 ? ` · ${unanswered} bekliyor` : ''} — günlük özet`;
+  }
+  if (unanswered > 0) return `${unanswered} yanıt bekliyor — günlük özet`;
+  if (cs && cs.sentToday > 0) return `${cs.sentToday} mail gönderildi — günlük özet`;
   const total =
     input.planned.length + input.hotLeads.length + input.rottingDeals.length + input.staleLeads.length;
-  if (total === 0) return 'Bugün sakin bir gün — özet';
-  const parts: string[] = [];
-  if (input.planned.length > 0) {
-    parts.push(`${input.planned.length} aktivite planlı`);
-  } else if (input.hotLeads.length > 0) {
-    parts.push(`${input.hotLeads.length} yeni sıcak lead`);
-  } else if (input.rottingDeals.length > 0) {
-    parts.push(`${input.rottingDeals.length} çürüyen deal`);
-  } else if (input.staleLeads.length > 0) {
-    parts.push(`${input.staleLeads.length} stale lead`);
-  }
-  return `${parts[0]} — bugünün özeti`;
+  if (total === 0) return 'Bugün sakin bir gün — satış özeti';
+  if (input.planned.length > 0) return `${input.planned.length} aktivite planlı — bugünün özeti`;
+  if (input.hotLeads.length > 0) return `${input.hotLeads.length} yeni sıcak lead — bugünün özeti`;
+  if (input.rottingDeals.length > 0) return `${input.rottingDeals.length} çürüyen deal — bugünün özeti`;
+  return `${input.staleLeads.length} stale lead — bugünün özeti`;
 }
 
 function htmlHeader(title: string): string {
@@ -200,20 +252,137 @@ ${rows}
 </ul>`;
 }
 
+function fmtTry(v: number | null | undefined): string {
+  if (v == null) return '—';
+  try {
+    return new Intl.NumberFormat('tr-TR', { style: 'currency', currency: 'TRY', maximumFractionDigits: 0 }).format(v);
+  } catch {
+    return `${Math.round(v)} TL`;
+  }
+}
+
+// ── Deliverability güvenlik şeridi (spam guardrail) ──
+function htmlDeliverabilitySection(d: DigestDeliverability | null | undefined): string {
+  if (!d) return '';
+  const color = d.status === 'alert' ? '#dc2626' : d.status === 'watch' ? '#d97706' : '#16a34a';
+  const bg = d.status === 'alert' ? '#fef2f2' : d.status === 'watch' ? '#fffbeb' : '#f0fdf4';
+  const label =
+    d.status === 'alert' ? '⚠ DİKKAT — gönderimi yavaşlat'
+    : d.status === 'watch' ? 'İzlemede' : '✓ Sağlıklı';
+  const rate = d.bounceRate7dPct == null ? '—' : `%${d.bounceRate7dPct.toFixed(1)}`;
+  const runway = d.queueRunwayDays == null ? '—' : `~${d.queueRunwayDays} gün`;
+  return `${htmlHeader('📤 Gönderim sağlığı')}
+<div style="background:${bg};border:1px solid ${color}33;border-radius:8px;padding:12px 14px;">
+  <div style="font-weight:600;color:${color};font-size:14px;margin-bottom:6px;">${label}</div>
+  <div style="color:#374151;font-size:13px;line-height:1.7;">
+    Bugün: <strong>${d.bouncedToday}</strong> bounce · <strong>${d.complainedToday}</strong> spam şikayeti<br>
+    7 gün: ${d.bounced7d} bounce / ${d.delivered7d} teslim · bounce oranı <strong>${rate}</strong> · spam ${d.complained7d}<br>
+    Kuyrukta ${d.queueRunwayDays == null ? '0' : ''}<strong>${runway}</strong> tükenir (mevcut hızla)
+  </div>
+</div>`;
+}
+
+// ── Kampanya özeti (cold outreach nabzı) ──
+function htmlCampaignSection(s: DigestCampaignSummary | null | undefined): string {
+  if (!s || s.campaigns.length === 0) return '';
+  const rate = s.replyRate7dPct == null ? '—' : `%${s.replyRate7dPct.toFixed(1)}`;
+  const cards = `<table role="presentation" style="width:100%;border-collapse:collapse;margin-bottom:10px;"><tr>
+    <td style="width:25%;text-align:center;padding:8px;background:#f5f3ff;border-radius:6px;"><div style="font-size:22px;font-weight:700;color:#5b21b6;">${s.sentToday}</div><div style="font-size:11px;color:#6b7280;">bugün gönderim</div></td>
+    <td style="width:2%;"></td>
+    <td style="width:23%;text-align:center;padding:8px;background:#f5f3ff;border-radius:6px;"><div style="font-size:22px;font-weight:700;color:#5b21b6;">${s.repliesLast24h}</div><div style="font-size:11px;color:#6b7280;">son 24s yanıt</div></td>
+    <td style="width:2%;"></td>
+    <td style="width:23%;text-align:center;padding:8px;background:#f5f3ff;border-radius:6px;"><div style="font-size:22px;font-weight:700;color:#5b21b6;">${s.newHotWarm24h}</div><div style="font-size:11px;color:#6b7280;">yeni sıcak</div></td>
+    <td style="width:2%;"></td>
+    <td style="width:23%;text-align:center;padding:8px;background:#f5f3ff;border-radius:6px;"><div style="font-size:22px;font-weight:700;color:#5b21b6;">${rate}</div><div style="font-size:11px;color:#6b7280;">yanıt oranı (7g)</div></td>
+  </tr></table>`;
+  const rows = s.campaigns
+    .map((c) => {
+      const name = escapeHtml(c.name);
+      return `<li style="padding:6px 0;border-bottom:1px solid #f3f4f6;font-size:13px;">
+  <strong>${name}</strong><br>
+  <span style="color:#16a34a;">${c.sentToday} gönderim</span> · ${c.repliesLast24h} yanıt · <span style="color:#6b7280;">${c.queued} kuyrukta</span>
+</li>`;
+    })
+    .join('');
+  return `${htmlHeader('📨 Kampanya özeti')}
+${cards}
+<ul style="list-style:none;padding:0;margin:0;">${rows}</ul>`;
+}
+
+// ── Aksiyon bloku: yanıtlanmamış yanıtlar ──
+function htmlUnansweredSection(items: DigestUnansweredReply[] | undefined): string {
+  if (!items || items.length === 0) return '';
+  const rows = items
+    .map((u) => `<li style="padding:8px 0;border-bottom:1px solid #f3f4f6;">
+  <div>💬 <strong>${escapeHtml(u.leadName)}</strong> <span style="color:#dc2626;font-size:12px;">— ${u.daysWaiting} gündür yanıt bekliyor</span></div>
+</li>`)
+    .join('');
+  return `${htmlHeader('⚠️ Yanıtlanmamış yanıtlar')}
+<ul style="list-style:none;padding:0;margin:0;">${rows}</ul>`;
+}
+
+// ── Aksiyon bloku: gecikmiş takipler ──
+function htmlOverdueSection(items: DigestPlannedActivity[] | undefined): string {
+  if (!items || items.length === 0) return '';
+  const rows = items
+    .map((a) => {
+      const kl = kindLabel(a.kind);
+      return `<li style="padding:8px 0;border-bottom:1px solid #f3f4f6;">
+  <div>${kl.icon} ${escapeHtml(kl.tr)} · <strong>${escapeHtml(a.leadName)}</strong></div>
+</li>`;
+    })
+    .join('');
+  return `${htmlHeader('⏰ Gecikmiş takipler')}
+<ul style="list-style:none;padding:0;margin:0;">${rows}</ul>`;
+}
+
+// ── Aksiyon bloku: deal'i olmayan sıcak lead'ler ──
+function htmlHotNoDealSection(items: DigestHotLeadNoDeal[] | undefined): string {
+  if (!items || items.length === 0) return '';
+  const rows = items
+    .map((l) => `<li style="padding:8px 0;border-bottom:1px solid #f3f4f6;">
+  <div>🔥 <strong>${escapeHtml(l.name)}</strong>${l.score != null ? ` <span style="color:#6b7280;font-size:12px;">(${l.score})</span>` : ''} <span style="color:#6b7280;font-size:12px;">— deal açılmamış</span></div>
+</li>`)
+    .join('');
+  return `${htmlHeader('🔥 Sıcak ama deal yok')}
+<ul style="list-style:none;padding:0;margin:0;">${rows}</ul>`;
+}
+
+// ── Yeni deal momentumı ──
+function htmlNewDealsSection(items: DigestNewDeal[] | undefined): string {
+  if (!items || items.length === 0) return '';
+  const rows = items
+    .map((d) => `<li style="padding:8px 0;border-bottom:1px solid #f3f4f6;">
+  <div>${d.auto ? '⚡ ' : ''}<strong>${escapeHtml(d.title)}</strong> <span style="color:#6b7280;font-size:12px;">${d.valueTry != null ? fmtTry(d.valueTry) : 'değer girilmemiş'}${d.auto ? ' · otomatik' : ''}</span></div>
+</li>`)
+    .join('');
+  return `${htmlHeader('🆕 Yeni deal (son 24s)')}
+<ul style="list-style:none;padding:0;margin:0;">${rows}</ul>`;
+}
+
+// Sakin gün hijyen çöküşü: planlı+çürüyen+stale hepsi boşsa tek satır
+function htmlQuietHygieneLine(input: DigestInput): string {
+  const empty = input.planned.length === 0 && input.rottingDeals.length === 0 && input.staleLeads.length === 0;
+  if (!empty) return '';
+  return `<div style="background:#f9fafb;border-radius:6px;padding:10px 12px;color:#6b7280;font-size:13px;margin-top:8px;">✓ Bugün sakin — planlı aktivite, çürüyen deal ve stale lead yok.</div>`;
+}
+
 function buildHtml(input: DigestInput): string {
   const today = escapeHtml(input.todayLabel);
   const name = escapeHtml(input.recipientName);
-  const total =
-    input.planned.length + input.hotLeads.length + input.rottingDeals.length + input.staleLeads.length;
-  const intro =
-    total === 0
-      ? '<p style="color:#374151;">Bugün için planlanmış aktivite, sıcak lead veya çürüyen deal yok. Sakin bir gün — yeni outreach atmaya iyi zaman.</p>'
-      : `<p style="color:#374151;">İşte bugünün özeti — yapılacaklar ve dikkat etmen gerekenler:</p>`;
+  const intro = `<p style="color:#374151;">İşte bugünün özeti — önce gönderim sağlığı ve fırsatlar, sonra yapılacaklar:</p>`;
   const sections = [
-    htmlPlannedSection(input.planned),
+    htmlDeliverabilitySection(input.deliverability),
+    htmlCampaignSection(input.campaignSummary),
+    htmlNewDealsSection(input.newDeals),
+    htmlUnansweredSection(input.unansweredReplies),
+    htmlOverdueSection(input.overdueFollowups),
+    htmlHotNoDealSection(input.hotLeadsNoDeal),
     htmlHotLeadsSection(input.hotLeads),
+    htmlPlannedSection(input.planned),
     htmlRottingSection(input.rottingDeals),
     htmlStaleSection(input.staleLeads),
+    htmlQuietHygieneLine(input),
   ]
     .filter(Boolean)
     .join('\n');
@@ -284,18 +453,55 @@ function textStale(items: DigestStaleLead[]): string {
   return `${textHeader('Uzun süredir temasta olmadıklarımız')}${rows}\n`;
 }
 
+function textDeliverability(d: DigestDeliverability | null | undefined): string {
+  if (!d) return '';
+  const label = d.status === 'alert' ? 'DİKKAT — yavaşla' : d.status === 'watch' ? 'İzlemede' : 'Sağlıklı';
+  const rate = d.bounceRate7dPct == null ? '—' : `%${d.bounceRate7dPct.toFixed(1)}`;
+  const runway = d.queueRunwayDays == null ? '—' : `~${d.queueRunwayDays} gün`;
+  return `${textHeader('Gönderim sağlığı')}- Durum: ${label}\n- Bugün: ${d.bouncedToday} bounce, ${d.complainedToday} spam şikayeti\n- 7 gün: ${d.bounced7d} bounce / ${d.delivered7d} teslim · oran ${rate} · spam ${d.complained7d}\n- Kuyruk: ${runway} tükenir\n`;
+}
+function textCampaign(s: DigestCampaignSummary | null | undefined): string {
+  if (!s || s.campaigns.length === 0) return '';
+  const rate = s.replyRate7dPct == null ? '—' : `%${s.replyRate7dPct.toFixed(1)}`;
+  const head = `- Bugün ${s.sentToday} gönderim · son 24s ${s.repliesLast24h} yanıt · ${s.newHotWarm24h} yeni sıcak · yanıt oranı ${rate}\n`;
+  const rows = s.campaigns
+    .map((c) => `  · ${c.name}: ${c.sentToday} gönderim, ${c.repliesLast24h} yanıt, ${c.queued} kuyrukta`)
+    .join('\n');
+  return `${textHeader('Kampanya özeti')}${head}${rows}\n`;
+}
+function textUnanswered(items: DigestUnansweredReply[] | undefined): string {
+  if (!items || items.length === 0) return '';
+  return `${textHeader('Yanıtlanmamış yanıtlar')}${items.map((u) => `- ${u.leadName} — ${u.daysWaiting} gündür bekliyor`).join('\n')}\n`;
+}
+function textOverdue(items: DigestPlannedActivity[] | undefined): string {
+  if (!items || items.length === 0) return '';
+  return `${textHeader('Gecikmiş takipler')}${items.map((a) => `- ${kindLabel(a.kind).tr} · ${a.leadName}`).join('\n')}\n`;
+}
+function textHotNoDeal(items: DigestHotLeadNoDeal[] | undefined): string {
+  if (!items || items.length === 0) return '';
+  return `${textHeader('Sıcak ama deal yok')}${items.map((l) => `- ${l.name}${l.score != null ? ` (${l.score})` : ''}`).join('\n')}\n`;
+}
+function textNewDeals(items: DigestNewDeal[] | undefined): string {
+  if (!items || items.length === 0) return '';
+  return `${textHeader('Yeni deal (son 24s)')}${items.map((d) => `- ${d.auto ? '[oto] ' : ''}${d.title} — ${d.valueTry != null ? fmtTry(d.valueTry) : 'değer girilmemiş'}`).join('\n')}\n`;
+}
+
 function buildText(input: DigestInput): string {
-  const total =
-    input.planned.length + input.hotLeads.length + input.rottingDeals.length + input.staleLeads.length;
-  const intro =
-    total === 0
-      ? 'Bugün için planlanmış aktivite, sıcak lead veya çürüyen deal yok. Sakin bir gün.'
-      : 'İşte bugünün özeti:';
+  const hygieneEmpty =
+    input.planned.length === 0 && input.rottingDeals.length === 0 && input.staleLeads.length === 0;
+  const intro = 'İşte bugünün özeti:';
   const sections = [
-    textPlanned(input.planned),
+    textDeliverability(input.deliverability),
+    textCampaign(input.campaignSummary),
+    textNewDeals(input.newDeals),
+    textUnanswered(input.unansweredReplies),
+    textOverdue(input.overdueFollowups),
+    textHotNoDeal(input.hotLeadsNoDeal),
     textHot(input.hotLeads),
+    textPlanned(input.planned),
     textRotting(input.rottingDeals),
     textStale(input.staleLeads),
+    hygieneEmpty ? '\nBugün sakin — planlı aktivite, çürüyen deal ve stale lead yok.\n' : '',
   ]
     .filter(Boolean)
     .join('');

@@ -22,11 +22,17 @@ import { sendDigestViaResend } from './digest-sender.js';
 import {
   composeDigestPayload,
   selectDigestRecipients,
+  type DigestPayload,
   type DigestHotLead,
   type DigestPlannedActivity,
   type DigestRottingDeal,
   type DigestStaleLead,
   type UserProfileLite,
+  type DigestCampaignSummary,
+  type DigestDeliverability,
+  type DigestNewDeal,
+  type DigestUnansweredReply,
+  type DigestHotLeadNoDeal,
 } from './digest-compose.js';
 
 const DIGEST_SENDER_EMAIL = process.env.DIGEST_SENDER_EMAIL ?? 'digest@send.constantineyachts.com';
@@ -222,6 +228,225 @@ async function fetchStaleLeads(now: Date): Promise<DigestStaleLead[]> {
 }
 
 // =========================================================
+// Yeni KPI fetcher'ları (2026-06-17) — her biri kendi try/catch'i ile
+// (biri patlasa bile rapor düşmesin, o bölüm boş geçsin)
+// =========================================================
+
+async function fetchCampaignSummary(bounds: TrDayBounds, now: Date): Promise<DigestCampaignSummary | null> {
+  try {
+    const since24hIso = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
+    const since7dIso = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    const rows = await sql<Array<{ name: string; sent_today: number; replies_24h: number; queued: number }>>`
+      SELECT c.name,
+        count(*) FILTER (WHERE ct.sent_at >= ${bounds.startUtcIso} AND ct.sent_at <= ${bounds.endUtcIso})::int AS sent_today,
+        count(*) FILTER (WHERE ct.replied_at >= ${since24hIso})::int AS replies_24h,
+        count(*) FILTER (WHERE ct.status = 'queued')::int AS queued
+      FROM campaigns c JOIN campaign_targets ct ON ct.campaign_id = c.id
+      WHERE c.status = 'running'
+      GROUP BY c.id, c.name
+      ORDER BY c.name
+    `;
+    const rate = await sql<Array<{ sent7d: number; rep7d: number }>>`
+      SELECT
+        count(*) FILTER (WHERE ct.sent_at >= ${since7dIso})::int AS sent7d,
+        count(*) FILTER (WHERE ct.replied_at >= ${since7dIso})::int AS rep7d
+      FROM campaigns c JOIN campaign_targets ct ON ct.campaign_id = c.id
+      WHERE c.status = 'running'
+    `;
+    const hw = await sql<Array<{ n: number }>>`
+      SELECT count(DISTINCT ct.lead_id)::int AS n
+      FROM campaign_targets ct JOIN leads l ON l.id = ct.lead_id
+      WHERE ct.replied_at >= ${since24hIso} AND l.temperature IN ('hot', 'warm')
+    `;
+    const campaigns = rows.map((r) => ({
+      name: r.name,
+      sentToday: Number(r.sent_today) || 0,
+      repliesLast24h: Number(r.replies_24h) || 0,
+      queued: Number(r.queued) || 0,
+    }));
+    if (campaigns.length === 0) return null;
+    const sentToday = campaigns.reduce((a, c) => a + c.sentToday, 0);
+    const repliesLast24h = campaigns.reduce((a, c) => a + c.repliesLast24h, 0);
+    const queuedTotal = campaigns.reduce((a, c) => a + c.queued, 0);
+    const s7 = Number(rate[0]?.sent7d) || 0;
+    const r7 = Number(rate[0]?.rep7d) || 0;
+    return {
+      campaigns,
+      sentToday,
+      repliesLast24h,
+      newHotWarm24h: Number(hw[0]?.n) || 0,
+      replyRate7dPct: s7 > 0 ? (r7 / s7) * 100 : null,
+      queuedTotal,
+    };
+  } catch (e: any) {
+    console.warn('[cron-daily-digest] fetchCampaignSummary failed:', e?.message);
+    return null;
+  }
+}
+
+async function fetchDeliverability(bounds: TrDayBounds, now: Date): Promise<DigestDeliverability | null> {
+  try {
+    const since7dIso = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    const ev = await sql<Array<{ bt: number; ct: number; b7: number; c7: number; d7: number }>>`
+      SELECT
+        count(*) FILTER (WHERE event_type='bounced'    AND occurred_at >= ${bounds.startUtcIso})::int AS bt,
+        count(*) FILTER (WHERE event_type='complained' AND occurred_at >= ${bounds.startUtcIso})::int AS ct,
+        count(*) FILTER (WHERE event_type='bounced'    AND occurred_at >= ${since7dIso})::int AS b7,
+        count(*) FILTER (WHERE event_type='complained' AND occurred_at >= ${since7dIso})::int AS c7,
+        count(*) FILTER (WHERE event_type='delivered'  AND occurred_at >= ${since7dIso})::int AS d7
+      FROM email_events
+    `;
+    const row = ev[0] ?? { bt: 0, ct: 0, b7: 0, c7: 0, d7: 0 };
+    const bt = Number(row.bt) || 0;
+    const b7 = Number(row.b7) || 0;
+    const c7 = Number(row.c7) || 0;
+    const d7 = Number(row.d7) || 0;
+    const denom = d7 + b7;
+    const bounceRate7dPct = denom > 0 ? (b7 / denom) * 100 : null;
+    const q = await sql<Array<{ cap: number; queued: number }>>`
+      SELECT
+        coalesce(sum(daily_cap), 0)::int AS cap,
+        (SELECT count(*) FROM campaign_targets ct JOIN campaigns c2 ON c2.id = ct.campaign_id
+          WHERE c2.status = 'running' AND ct.status = 'queued')::int AS queued
+      FROM campaigns WHERE status = 'running'
+    `;
+    const cap = Number(q[0]?.cap) || 0;
+    const queued = Number(q[0]?.queued) || 0;
+    const queueRunwayDays = cap > 0 ? Math.ceil(queued / cap) : null;
+    let status: 'healthy' | 'watch' | 'alert' = 'healthy';
+    if (c7 > 0 || (bounceRate7dPct != null && bounceRate7dPct >= 5)) status = 'alert';
+    else if (bt > 0 || (bounceRate7dPct != null && bounceRate7dPct >= 2)) status = 'watch';
+    return {
+      bouncedToday: bt,
+      complainedToday: Number(row.ct) || 0,
+      bounced7d: b7,
+      complained7d: c7,
+      delivered7d: d7,
+      bounceRate7dPct,
+      queueRunwayDays,
+      status,
+    };
+  } catch (e: any) {
+    console.warn('[cron-daily-digest] fetchDeliverability failed:', e?.message);
+    return null;
+  }
+}
+
+async function fetchNewDeals(now: Date): Promise<DigestNewDeal[]> {
+  try {
+    const since24hIso = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
+    const rows = await sql<Array<{ id: string; title: string; value_try: number | null; notes: string | null }>>`
+      SELECT id, title, value_try, notes FROM deals
+      WHERE created_at >= ${since24hIso}
+      ORDER BY created_at DESC LIMIT 15
+    `;
+    return rows.map((d) => ({
+      id: d.id,
+      title: d.title,
+      valueTry: d.value_try,
+      auto: typeof d.notes === 'string' && d.notes.startsWith('Otomatik:'),
+    }));
+  } catch (e: any) {
+    console.warn('[cron-daily-digest] fetchNewDeals failed:', e?.message);
+    return [];
+  }
+}
+
+async function fetchUnansweredReplies(now: Date): Promise<DigestUnansweredReply[]> {
+  try {
+    const rows = await sql<Array<{ lead_id: string; company_name: string | null; son_in: string }>>`
+      SELECT t.lead_id, l.company_name, m.son_in
+      FROM email_threads t
+      JOIN leads l ON l.id = t.lead_id
+      JOIN LATERAL (
+        SELECT
+          max(COALESCE(received_at, created_at)) FILTER (WHERE direction = 'inbound')  AS son_in,
+          max(COALESCE(sent_at, created_at))      FILTER (WHERE direction = 'outbound') AS son_out
+        FROM email_messages WHERE thread_id = t.id
+      ) m ON true
+      WHERE t.lead_id IS NOT NULL
+        AND m.son_in IS NOT NULL
+        AND (m.son_out IS NULL OR m.son_in > m.son_out)
+      ORDER BY m.son_in ASC
+      LIMIT 30
+    `;
+    const DAY = 86_400_000;
+    // lead bazında dedup (fragmente thread'lerde aynı lead 2x çıkmasın → en uzun bekleyeni tut)
+    const byLead = new Map<string, DigestUnansweredReply>();
+    for (const r of rows) {
+      const days = Math.max(0, Math.floor((now.getTime() - new Date(r.son_in).getTime()) / DAY));
+      const existing = byLead.get(r.lead_id);
+      if (!existing || days > existing.daysWaiting) {
+        byLead.set(r.lead_id, { leadId: r.lead_id, leadName: r.company_name ?? '(isimsiz)', daysWaiting: days });
+      }
+    }
+    return Array.from(byLead.values()).sort((a, b) => b.daysWaiting - a.daysWaiting).slice(0, 15);
+  } catch (e: any) {
+    console.warn('[cron-daily-digest] fetchUnansweredReplies failed:', e?.message);
+    return [];
+  }
+}
+
+async function fetchOverdueFollowups(bounds: TrDayBounds, now: Date): Promise<DigestPlannedActivity[]> {
+  try {
+    const cutoffIso = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString();
+    const rows = await sql<Array<{ id: string; target_id: string; event_type: string; metadata: any }>>`
+      SELECT id, target_id, event_type, metadata
+      FROM activity_events
+      WHERE target_type = 'lead'
+        AND event_type IN ('manual_call', 'meeting', 'note')
+        AND metadata->>'due_at' < ${bounds.startUtcIso}
+        AND metadata->>'due_at' >= ${cutoffIso}
+      ORDER BY metadata->>'due_at' ASC
+      LIMIT 15
+    `;
+    if (rows.length === 0) return [];
+    const leadIds = Array.from(new Set(rows.map((r) => r.target_id).filter(Boolean)));
+    const leadMap = new Map<string, string>();
+    if (leadIds.length > 0) {
+      const leads = await sql<Array<{ id: string; company_name: string }>>`
+        SELECT id, company_name FROM leads WHERE id IN ${sql(leadIds)}
+      `;
+      for (const l of leads) leadMap.set(l.id, l.company_name);
+    }
+    const out: DigestPlannedActivity[] = [];
+    for (const row of rows) {
+      const md = (row.metadata ?? {}) as Record<string, unknown>;
+      const dueAt = typeof md['due_at'] === 'string' ? (md['due_at'] as string) : null;
+      if (!dueAt) continue;
+      out.push({
+        id: row.id,
+        kind: row.event_type,
+        leadId: row.target_id,
+        leadName: leadMap.get(row.target_id) ?? '(lead silinmiş)',
+        dueAtIso: dueAt,
+        note: typeof md['note'] === 'string' ? (md['note'] as string) : null,
+      });
+    }
+    return out;
+  } catch (e: any) {
+    console.warn('[cron-daily-digest] fetchOverdueFollowups failed:', e?.message);
+    return [];
+  }
+}
+
+async function fetchHotLeadsNoDeal(): Promise<DigestHotLeadNoDeal[]> {
+  try {
+    const rows = await sql<Array<{ id: string; company_name: string; score: number | null }>>`
+      SELECT id, company_name, score FROM leads
+      WHERE temperature = 'hot' AND deal_id IS NULL
+        AND status NOT IN ('won', 'lost', 'opted_out')
+      ORDER BY score DESC NULLS LAST
+      LIMIT 15
+    `;
+    return rows.map((l) => ({ id: l.id, name: l.company_name, score: l.score }));
+  } catch (e: any) {
+    console.warn('[cron-daily-digest] fetchHotLeadsNoDeal failed:', e?.message);
+    return [];
+  }
+}
+
+// =========================================================
 // Core runner (Hono handler + cron-scheduler ortak çağırır)
 // =========================================================
 
@@ -285,11 +510,20 @@ export async function runSalesDailyDigest(): Promise<DigestRunResult> {
   const now = new Date();
   const bounds = getTrDayBounds(now);
 
-  const [planned, hotLeads, rotting, stale] = await Promise.all([
+  const [
+    planned, hotLeads, rotting, stale,
+    campaignSummary, deliverability, newDeals, unansweredReplies, overdueFollowups, hotLeadsNoDeal,
+  ] = await Promise.all([
     fetchPlannedToday(bounds),
     fetchHotLeads(now),
     fetchRottingDeals(now),
     fetchStaleLeads(now),
+    fetchCampaignSummary(bounds, now),
+    fetchDeliverability(bounds, now),
+    fetchNewDeals(now),
+    fetchUnansweredReplies(now),
+    fetchOverdueFollowups(bounds, now),
+    fetchHotLeadsNoDeal(),
   ]);
 
   // 4. Compose + send per recipient (Resend 5 req/s rate limit'i koru)
@@ -315,6 +549,12 @@ export async function runSalesDailyDigest(): Promise<DigestRunResult> {
       hotLeads,
       rottingDeals: rotting,
       staleLeads: stale,
+      campaignSummary,
+      deliverability,
+      newDeals,
+      unansweredReplies,
+      overdueFollowups,
+      hotLeadsNoDeal,
     });
 
     const result = await sendDigestViaResend({
@@ -374,6 +614,34 @@ export async function runSalesDailyDigest(): Promise<DigestRunResult> {
     },
     date: bounds.dateLabel,
   };
+}
+
+// =========================================================
+// Önizleme (no-send) — gerçek veriyle compose, GÖNDERMEZ
+// =========================================================
+export async function previewSalesDigest(recipientName = 'Mert', now = new Date()): Promise<DigestPayload> {
+  const bounds = getTrDayBounds(now);
+  const [
+    planned, hotLeads, rotting, stale,
+    campaignSummary, deliverability, newDeals, unansweredReplies, overdueFollowups, hotLeadsNoDeal,
+  ] = await Promise.all([
+    fetchPlannedToday(bounds),
+    fetchHotLeads(now),
+    fetchRottingDeals(now),
+    fetchStaleLeads(now),
+    fetchCampaignSummary(bounds, now),
+    fetchDeliverability(bounds, now),
+    fetchNewDeals(now),
+    fetchUnansweredReplies(now),
+    fetchOverdueFollowups(bounds, now),
+    fetchHotLeadsNoDeal(),
+  ]);
+  return composeDigestPayload({
+    recipientName,
+    todayLabel: bounds.dateLabel,
+    planned, hotLeads, rottingDeals: rotting, staleLeads: stale,
+    campaignSummary, deliverability, newDeals, unansweredReplies, overdueFollowups, hotLeadsNoDeal,
+  });
 }
 
 // =========================================================
