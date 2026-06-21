@@ -29,12 +29,47 @@ const BATCH_SIZE = Number(process.env.CAMPAIGN_WORKER_BATCH_SIZE ?? 10);
 const SEND_GAP_MS = Number(process.env.CAMPAIGN_WORKER_SEND_GAP_MS ?? 250); // 5 req/s'den güvenli aralık
 // Gönderim penceresi saat dilimi — kampanya send_window/send_days'i bu tz'de değerlendirilir.
 const SEND_TZ = process.env.CAMPAIGN_WORKER_TZ ?? 'Europe/Istanbul';
+// Tek bir gönderimin maksimum süresi. Bunu aşarsa asılı kabul edilir (worker donmasın). 90sn cömert (gerçek gönderim <10sn).
+const SEND_TIMEOUT_MS = Number(process.env.CAMPAIGN_WORKER_SEND_TIMEOUT_MS ?? 90_000);
 
 let tickHandle: NodeJS.Timeout | null = null;
 let running = false;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Worker dayanıklılığı (2026-06-19 fix). sendEmailCore'u timeout ile sarar. Altta yatan ağ
+ * çağrısı (SMTP relay / Resend HTTP) süresiz asılırsa await ASLA dönmez → for-loop donar →
+ * tick bitmez → `running` flag'i true takılı kalır → TÜM worker sessizce ölür. Gözlenen olay:
+ * gönderim 10:55'te durdu, 6.5 saat hiç tick yok, hata bile loglanmadı (sessiz asılma).
+ * Bu wrapper SEND_TIMEOUT_MS sonra asılan gönderimi reddeder; çağıran döngü bunu sıradan bir
+ * "geçici hata" sonucu gibi işleyip SIRADAKİNE geçer, worker yaşamaya devam eder.
+ */
+async function sendWithTimeout(
+  input: Parameters<typeof sendEmailCore>[0],
+  ctx: Parameters<typeof sendEmailCore>[1],
+  label: string,
+): Promise<Awaited<ReturnType<typeof sendEmailCore>>> {
+  let timer: NodeJS.Timeout | undefined;
+  const p = sendEmailCore(input, ctx);
+  p.catch(() => {}); // timeout race'i kazanırsa orijinal promise'in geç reddi unhandled kalmasın
+  try {
+    return await Promise.race([
+      p,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`send_timeout ${SEND_TIMEOUT_MS}ms`)), SEND_TIMEOUT_MS);
+      }),
+    ]);
+  } catch (e: any) {
+    console.error(`[worker] send timeout/err (${label}): ${e?.message}`);
+    return { success: false, error: `send_timeout: ${e?.message ?? 'unknown'}` } as Awaited<
+      ReturnType<typeof sendEmailCore>
+    >;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
@@ -268,7 +303,7 @@ async function processFollowUps(
 
     const orig = await fetchOriginalSend(campaign.id, t.lead_id);
 
-    const result = await sendEmailCore(
+    const result = await sendWithTimeout(
       {
         lead_id: t.lead_id,
         template_id: stepCfg.template_id,
@@ -281,6 +316,7 @@ async function processFollowUps(
         text_only: campaign.send_text_only === true,      // G7 (first_email_text_only sadece step 0 için)
       },
       { userId: ctxUserId, role: 'super_admin' },
+      `followup ${t.id} step ${nextStep}`,
     );
 
     if (result.success || result.deduped) {
@@ -381,7 +417,7 @@ async function processInitials(
     // Agent Day 2026-06-04 follow-up gibi her lead'in farklı kişiselleştirilmiş içeriği
     // olduğu VIP batch'lerde kullanılır.
     const hasOverride = !!(target.body_text_override && target.body_text_override.trim());
-    const result = await sendEmailCore(
+    const result = await sendWithTimeout(
       {
         lead_id: target.lead_id,
         template_id: hasOverride ? undefined : (campaign.template_id ?? undefined),
@@ -396,6 +432,7 @@ async function processInitials(
         text_only: campaign.send_text_only === true || campaign.first_email_text_only === true, // G7
       },
       { userId: ctxUserId, role: 'super_admin' },
+      `init ${target.id}`,
     );
 
     if (result.success) {
