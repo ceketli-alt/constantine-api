@@ -47,6 +47,7 @@ import { handleSettlementSnapshot, handleSettlementTransfer, handleSettlementTra
 import { handleGoogleOAuthCallback } from './google-oauth.js';
 import { handleCalendarPull, handleCalendarPush, handleCalendarImport, handleCalendarBackfill } from './google-calendar.js';
 import { handlePartnerCalendarSync } from './partner-calendar-sync.js';
+import { handleConstantineSyncProvision, handleConstantineSyncRun } from './constantine-sync.js';
 import { sendTestEmail, sendEmail } from './resend-send.js';
 import {
   verifyAnyJWT,
@@ -310,7 +311,7 @@ app.get('/functions/v1/', (c) => c.json({
     'wp-send', 'wp-webhook',
     'gmail-oauth-callback', 'google-oauth-callback',
     'google-calendar-pull', 'google-calendar-push', 'google-calendar-import', 'google-calendar-backfill',
-    'partner-calendar-sync',
+    'partner-calendar-sync', 'constantine-sync-provision', 'constantine-sync-run',
     'mail-metrics', 'mail-health', 'mail-events',
   ],
 }));
@@ -436,6 +437,10 @@ app.post('/functions/v1/google-calendar-backfill', (c) => handleCalendarBackfill
 
 // Partner tekne takvim senkronu — manuel tetik (cron 10dk'da bir otomatik koşar)
 app.post('/functions/v1/partner-calendar-sync', (c) => handlePartnerCalendarSync(c));
+
+// Constantine çift-yön takvim senkronu (Simon) — provision (takvim oluştur+paylaş) + manuel tetik
+app.post('/functions/v1/constantine-sync-provision', (c) => handleConstantineSyncProvision(c));
+app.post('/functions/v1/constantine-sync-run', (c) => handleConstantineSyncRun(c));
 
 // Settlement (Hesaplaşma) — CONSTANTINE teknesi için ortak hesap kitap
 app.post('/functions/v1/settlement-snapshot', (c) => handleSettlementSnapshot(c));
