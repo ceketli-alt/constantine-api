@@ -31,6 +31,17 @@ const SEND_GAP_MS = Number(process.env.CAMPAIGN_WORKER_SEND_GAP_MS ?? 250); // 5
 const SEND_TZ = process.env.CAMPAIGN_WORKER_TZ ?? 'Europe/Istanbul';
 // Tek bir gönderimin maksimum süresi. Bunu aşarsa asılı kabul edilir (worker donmasın). 90sn cömert (gerçek gönderim <10sn).
 const SEND_TIMEOUT_MS = Number(process.env.CAMPAIGN_WORKER_SEND_TIMEOUT_MS ?? 90_000);
+// Free-email sağlayıcıları — bunlar ŞİRKET DEĞİL (37 farklı işletme gmail.com kullanabilir). Per-company
+// günlük domain limiti (max_per_company_per_day) bunlara UYGULANMAZ; yoksa tek "gmail.com" kümesi tüm
+// kampanyayı günde 1'e kısar ve kuyruğun önünü tıkar (2026-06-22 stall: 89 queued'ın 37'si gmail).
+const FREEMAIL = new Set<string>([
+  'gmail.com', 'googlemail.com', 'hotmail.com', 'hotmail.co.uk', 'hotmail.com.tr',
+  'outlook.com', 'outlook.com.tr', 'live.com', 'live.com.tr', 'msn.com', 'windowslive.com',
+  'yahoo.com', 'yahoo.com.tr', 'ymail.com', 'rocketmail.com',
+  'icloud.com', 'me.com', 'mac.com', 'aol.com',
+  'gmx.com', 'gmx.net', 'mail.com', 'yandex.com', 'yandex.com.tr', 'yandex.ru',
+  'proton.me', 'protonmail.com',
+]);
 
 let tickHandle: NodeJS.Timeout | null = null;
 let running = false;
@@ -409,7 +420,11 @@ async function processInitials(
     // G8 — alıcı domain'i günlük kapasiteyi doldurduysa bu lead'i ATLA (queued kalır, ertesi tick/gün denenir)
     const recipient = (overrideTo ?? target.primary_contact_email ?? '').toLowerCase();
     const domain = recipient.includes('@') ? recipient.split('@')[1]! : '';
-    if (maxPerCompany != null && maxPerCompany > 0 && domain && (domainCount.get(domain) ?? 0) >= maxPerCompany) {
+    // Free-email (gmail/hotmail/yahoo...) ŞİRKET DEĞİL → per-company limitinden MUAF (yoksa kuyruk tıkanır).
+    if (
+      maxPerCompany != null && maxPerCompany > 0 && domain &&
+      !FREEMAIL.has(domain) && (domainCount.get(domain) ?? 0) >= maxPerCompany
+    ) {
       continue;
     }
 
@@ -437,7 +452,7 @@ async function processInitials(
 
     if (result.success) {
       sentCount++;
-      if (domain) domainCount.set(domain, (domainCount.get(domain) ?? 0) + 1); // G8 tally
+      if (domain && !FREEMAIL.has(domain)) domainCount.set(domain, (domainCount.get(domain) ?? 0) + 1); // G8 tally (free-email hariç)
       // status='sent' → trigger next_followup_at'i (follow_up_steps varsa) kurar
       await sql`
         UPDATE campaign_targets

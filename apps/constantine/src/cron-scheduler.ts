@@ -21,6 +21,7 @@ import { runSalesDailyDigest } from './cron-daily-digest.js';
 import { runWeeklyTrendDigest } from './cron-weekly-digest.js';
 import { runOpsDailyDigest } from './daily-digest.js';
 import { runPartnerCalendarSync } from './partner-calendar-sync.js';
+import { runConstantineSync } from './constantine-sync.js';
 
 let warmupTask: ScheduledTask | null = null;
 let scoresTask: ScheduledTask | null = null;
@@ -32,6 +33,7 @@ let opsDigestTask: ScheduledTask | null = null;
 let opsEveningDigestTask: ScheduledTask | null = null;
 let notifCleanupTask: ScheduledTask | null = null;
 let partnerSyncTask: ScheduledTask | null = null;
+let constantineSyncTask: ScheduledTask | null = null;
 
 async function loadCronEnabled(): Promise<boolean> {
   try {
@@ -113,6 +115,24 @@ async function safeRunPartnerSync(): Promise<void> {
     }
   } catch (e: any) {
     console.error('[cron-scheduler] partner-sync error:', e?.message);
+  }
+}
+
+/** Constantine çift-yön takvim senkronu (Simon) — 10dk'da bir, partner-sync'ten 5dk offset.
+ *  sync_enabled=true tekneler için push (CRM→Dolu blok) + pull (Simon event→pending booking)
+ *  + reconcile. Hiç sync_enabled tekne yoksa no-op (Simon e-postası gelene dek pasif). */
+async function safeRunConstantineSync(): Promise<void> {
+  if (!(await loadCronEnabled())) {
+    return;
+  }
+  try {
+    const result = await runConstantineSync();
+    if (result.errors.length > 0 || result.pushed > 0 || result.ingestedEvents > 0 ||
+        result.blocksDeleted > 0 || result.rejectedCleaned > 0 || result.withdrawn > 0) {
+      console.log(`[cron-scheduler] constantine-sync: boats=${result.boats} pushed=${result.pushed} ingested=${result.ingestedEvents} rejected=${result.rejectedCleaned} withdrawn=${result.withdrawn} errors=${result.errors.length}`);
+    }
+  } catch (e: any) {
+    console.error('[cron-scheduler] constantine-sync error:', e?.message);
   }
 }
 
@@ -341,6 +361,12 @@ export function startCronScheduler(): void {
     safeRunPartnerSync().catch((e) => console.error('[cron-scheduler] partner-sync unhandled:', e?.message));
   }, { timezone: 'UTC' });
 
+  // constantine çift-yön takvim senkronu (Simon): 10dk'da bir, partner-sync'ten 5dk offset
+  // (5,15,...,55) — token refresh'leri ve API yükü çakışmasın.
+  constantineSyncTask = cron.schedule('5-59/10 * * * *', () => {
+    safeRunConstantineSync().catch((e) => console.error('[cron-scheduler] constantine-sync unhandled:', e?.message));
+  }, { timezone: 'UTC' });
+
   console.log('[cron-scheduler] scheduled:');
   console.log('  - warmup-tick: cron("0 0 * * *", UTC)');
   console.log('  - recompute-scores: cron("*/15 * * * *", UTC)');
@@ -353,6 +379,7 @@ export function startCronScheduler(): void {
   console.log('  - notifications cleanup: cron("0 1 * * *", UTC = TR 04:00) — 90g okunmuş + 180g okunmamış sil');
   console.log('  - lead_scores cleanup: cron("0 1 * * *", UTC = TR 04:00) — lead başına son 20 snapshot tut');
   console.log('  - partner-calendar-sync: cron("*/10 * * * *", UTC) — agency_only tekneler freeBusy → boat_busy_slots');
+  console.log('  - constantine-sync: cron("5-59/10 * * * *", UTC) — sync_enabled tekneler çift-yön (Simon)');
 }
 
 export function stopCronScheduler(): void {
@@ -366,5 +393,6 @@ export function stopCronScheduler(): void {
   if (opsEveningDigestTask) { opsEveningDigestTask.stop(); opsEveningDigestTask = null; }
   if (notifCleanupTask) { notifCleanupTask.stop(); notifCleanupTask = null; }
   if (partnerSyncTask) { partnerSyncTask.stop(); partnerSyncTask = null; }
+  if (constantineSyncTask) { constantineSyncTask.stop(); constantineSyncTask = null; }
   console.log('[cron-scheduler] stopped');
 }

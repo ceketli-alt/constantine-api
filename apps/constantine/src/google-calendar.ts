@@ -7,7 +7,7 @@ import { sql } from './db.js';
 import { requireAuth } from './middleware.js';
 import {
   getAccessTokenForBoat,
-  listCalendarEvents,
+  listCalendarEventsAll,
   createCalendarEvent,
   updateCalendarEvent,
   deleteCalendarEvent,
@@ -82,6 +82,7 @@ export async function handleCalendarPull(c: Context): Promise<Response> {
 
   const allPreviews: any[] = [];
   const failedBoats: any[] = [];
+  const truncatedBoats: any[] = [];  // events.list page-cap'e takıldı → uzak-gelecek event'ler eksik olabilir
 
   // Backend B5 fix: token resolve race — Promise.all içinde paralel getAccessTokenForBoat
   // çağrıları aynı boat için yapılırsa (örn. shared id veya idempotent re-entry) iki refresh
@@ -101,7 +102,9 @@ export async function handleCalendarPull(c: Context): Promise<Response> {
     if (!accessToken) return; // token resolve fail — failedBoats'a yukarıda eklendi
     const calId = boat.google_calendar_id || 'primary';
     try {
-      const events = await listCalendarEvents({ accessToken, calendarId: calId, timeMin, timeMax });
+      // Sayfalı oku (nextPageToken) — tek-sayfa 250 cap'i uzak-gelecek event'leri sessizce düşürürdü.
+      const { events, truncated } = await listCalendarEventsAll({ accessToken, calendarId: calId, timeMin, timeMax });
+      if (truncated) truncatedBoats.push({ boat_id: boat.id, boat_name: boat.name });
       for (const ev of events) {
         if (ev.status === 'cancelled') continue;
         const startIso = ev.start.dateTime ?? (ev.start.date ? `${ev.start.date}T00:00:00Z` : null);
@@ -137,7 +140,7 @@ export async function handleCalendarPull(c: Context): Promise<Response> {
   }));
 
   allPreviews.sort((a, b) => a.start_iso.localeCompare(b.start_iso));
-  return c.json({ events: allPreviews, failed_boats: failedBoats });
+  return c.json({ events: allPreviews, failed_boats: failedBoats, truncated_boats: truncatedBoats });
 }
 
 /**

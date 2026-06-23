@@ -104,24 +104,51 @@ export interface CalendarEvent {
   end: { dateTime?: string; date?: string; timeZone?: string };
   status?: 'confirmed' | 'tentative' | 'cancelled';
   htmlLink?: string;
+  extendedProperties?: { private?: Record<string, string>; shared?: Record<string, string> };
 }
 
-export async function listCalendarEvents(opts: {
+/**
+ * events.list — TÜM sayfaları gez (nextPageToken). Sync motoru bunu "silinme oracle'ı"
+ * olarak kullandığı için eksik sayfa = yanlış withdraw iptali demek; bu yüzden tam liste şart.
+ * `truncated`: page cap'e takılıp hâlâ token kaldıysa true (eksik okuma sinyali → withdraw atlanmalı).
+ */
+export async function listCalendarEventsAll(opts: {
   accessToken: string;
   calendarId: string;
   timeMin: string;
   timeMax: string;
-}): Promise<CalendarEvent[]> {
-  const url = new URL(`${GOOGLE_CALENDAR_BASE}/calendars/${encodeURIComponent(opts.calendarId)}/events`);
-  url.searchParams.set('timeMin', opts.timeMin);
-  url.searchParams.set('timeMax', opts.timeMax);
-  url.searchParams.set('singleEvents', 'true');
-  url.searchParams.set('orderBy', 'startTime');
-  url.searchParams.set('maxResults', '250');
-  const r = await fetch(url.toString(), { headers: { Authorization: `Bearer ${opts.accessToken}` } });
-  if (!r.ok) throw new Error(`events.list failed: ${r.status} ${await r.text()}`);
-  const json = await r.json() as { items?: CalendarEvent[] };
-  return json.items ?? [];
+  maxPages?: number;
+}): Promise<{ events: CalendarEvent[]; truncated: boolean }> {
+  const maxPages = opts.maxPages ?? 20;
+  const events: CalendarEvent[] = [];
+  let pageToken: string | undefined;
+  let pages = 0;
+  do {
+    const url = new URL(`${GOOGLE_CALENDAR_BASE}/calendars/${encodeURIComponent(opts.calendarId)}/events`);
+    url.searchParams.set('timeMin', opts.timeMin);
+    url.searchParams.set('timeMax', opts.timeMax);
+    url.searchParams.set('singleEvents', 'true');
+    url.searchParams.set('orderBy', 'startTime');
+    url.searchParams.set('maxResults', '250');
+    if (pageToken) url.searchParams.set('pageToken', pageToken);
+    const r = await fetch(url.toString(), { headers: { Authorization: `Bearer ${opts.accessToken}` } });
+    if (!r.ok) throw new Error(`events.list failed: ${r.status} ${await r.text()}`);
+    const json = await r.json() as { items?: CalendarEvent[]; nextPageToken?: string };
+    if (json.items) events.push(...json.items);
+    pageToken = json.nextPageToken;
+    pages++;
+  } while (pageToken && pages < maxPages);
+  return { events, truncated: !!pageToken };
+}
+
+/** events.get — tek event'in varlığını teyit eder. 404/410/cancelled → exists:false (gerçekten gitmiş). */
+export async function getCalendarEvent(opts: { accessToken: string; calendarId: string; eventId: string }): Promise<{ exists: boolean }> {
+  const url = `${GOOGLE_CALENDAR_BASE}/calendars/${encodeURIComponent(opts.calendarId)}/events/${encodeURIComponent(opts.eventId)}`;
+  const r = await fetch(url, { headers: { Authorization: `Bearer ${opts.accessToken}` } });
+  if (r.status === 404 || r.status === 410) return { exists: false };
+  if (!r.ok) throw new Error(`events.get failed: ${r.status} ${await r.text()}`);
+  const json = await r.json() as { status?: string };
+  return { exists: json.status !== 'cancelled' };
 }
 
 /**
@@ -159,9 +186,12 @@ export interface NewCalendarEvent {
   summary: string;
   description?: string;
   location?: string;
-  start: { dateTime: string; timeZone?: string };
-  end: { dateTime: string; timeZone?: string };
+  // dateTime (saatli) VEYA date (all-day) — biri verilir.
+  start: { dateTime?: string; date?: string; timeZone?: string };
+  end: { dateTime?: string; date?: string; timeZone?: string };
   colorId?: string;
+  transparency?: 'opaque' | 'transparent';
+  extendedProperties?: { private?: Record<string, string>; shared?: Record<string, string> };
 }
 
 export async function createCalendarEvent(opts: { accessToken: string; calendarId: string; event: NewCalendarEvent }) {
@@ -192,4 +222,25 @@ export async function deleteCalendarEvent(opts: { accessToken: string; calendarI
     headers: { Authorization: `Bearer ${opts.accessToken}` },
   });
   if (!r.ok && r.status !== 410) throw new Error(`events.delete failed: ${r.status} ${await r.text()}`);
+}
+
+/** Yeni (ayrı) takvim oluştur — bağlı hesabın içinde. Booking-sync için kullanılır. */
+export async function createCalendar(opts: { accessToken: string; summary: string; timeZone?: string; description?: string }): Promise<{ id: string }> {
+  const r = await fetch(`${GOOGLE_CALENDAR_BASE}/calendars`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${opts.accessToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ summary: opts.summary, timeZone: opts.timeZone ?? 'Europe/Istanbul', description: opts.description }),
+  });
+  if (!r.ok) throw new Error(`calendars.insert failed: ${r.status} ${await r.text()}`);
+  return await r.json() as { id: string };
+}
+
+/** Takvimi bir kullanıcıyla paylaş (ACL kuralı ekle). role: 'reader' | 'writer'. */
+export async function shareCalendar(opts: { accessToken: string; calendarId: string; email: string; role?: 'reader' | 'writer' }): Promise<void> {
+  const r = await fetch(`${GOOGLE_CALENDAR_BASE}/calendars/${encodeURIComponent(opts.calendarId)}/acl`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${opts.accessToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ role: opts.role ?? 'writer', scope: { type: 'user', value: opts.email } }),
+  });
+  if (!r.ok) throw new Error(`acl.insert failed: ${r.status} ${await r.text()}`);
 }
