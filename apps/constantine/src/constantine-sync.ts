@@ -149,7 +149,7 @@ export interface ConstantineSyncResult {
   errors: Array<{ boat_id: string; boat_name: string; error: string }>;
 }
 
-interface SyncBoat { id: string; name: string; sync_calendar_id: string }
+interface SyncBoat { id: string; name: string; sync_calendar_id: string; sync_partner_channel_id: string | null }
 
 export async function runConstantineSync(boatIds?: string[]): Promise<ConstantineSyncResult> {
   const result: ConstantineSyncResult = {
@@ -180,13 +180,13 @@ export async function runConstantineSync(boatIds?: string[]): Promise<Constantin
 async function runConstantineSyncLocked(result: ConstantineSyncResult, boatIds?: string[]): Promise<void> {
   const boats = (boatIds && boatIds.length > 0
     ? await sql`
-        SELECT id, name, sync_calendar_id FROM boats
+        SELECT id, name, sync_calendar_id, sync_partner_channel_id FROM boats
         WHERE sync_enabled = true AND sync_calendar_id IS NOT NULL
           AND google_calendar_connected = true AND active = true
           AND id = ANY(${boatIds}::uuid[])
       `
     : await sql`
-        SELECT id, name, sync_calendar_id FROM boats
+        SELECT id, name, sync_calendar_id, sync_partner_channel_id FROM boats
         WHERE sync_enabled = true AND sync_calendar_id IS NOT NULL
           AND google_calendar_connected = true AND active = true
       `) as unknown as SyncBoat[];
@@ -320,9 +320,9 @@ async function runConstantineSyncLocked(result: ConstantineSyncResult, boatIds?:
             await sql.begin(async (tx) => {
               for (const d of addRows) {
                 await tx`
-                  INSERT INTO bookings (date, guest_name, boat_id, start_time, duration_hours,
+                  INSERT INTO bookings (date, guest_name, boat_id, channel_id, start_time, duration_hours,
                                         status, approval_status, notes, sync_calendar_event_id, sync_origin)
-                  VALUES (${d.date}::date, ${guestName}, ${boat.id}, ${d.start_time}, ${d.duration_hours},
+                  VALUES (${d.date}::date, ${guestName}, ${boat.id}, ${boat.sync_partner_channel_id}, ${d.start_time}, ${d.duration_hours},
                           'draft', 'pending', ${notes}, ${evId}, 'partner')
                 `;
               }
