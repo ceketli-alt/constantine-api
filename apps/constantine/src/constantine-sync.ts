@@ -55,15 +55,31 @@ export function isCrmBlock(ev: CalendarEvent): boolean {
   return ev.extendedProperties?.private?.[CRM_MARKER_KEY] === CRM_MARKER_VAL;
 }
 
-/** Bir CRM bookingi için detaysız all-day "Dolu" blok gövdesi. */
-export function buildCrmBlockEvent(dateStr: string, bookingId: string): NewCalendarEvent {
-  return {
+/**
+ * Bir CRM bookingi için "Dolu" blok gövdesi (müşteri verisi YOK, sadece "Dolu" + saat).
+ *   - start_time VARSA → SAATLİ event (Simon gerçek aralığı görür, ör. 10:00–14:00).
+ *   - start_time YOKSA (tam-gün booking) → all-day event.
+ * Istanbul sabit UTC+3 (2016'dan beri DST yok) → offset explicit, sunucu TZ'sinden bağımsız.
+ */
+export function buildCrmBlockEvent(
+  dateStr: string,
+  bookingId: string,
+  startTime?: string | null,
+  durationHours?: number | null,
+): NewCalendarEvent {
+  const base = {
     summary: BLOCK_SUMMARY,
-    start: { date: dateStr },
-    end: { date: addDaysToDateStr(dateStr, 1) }, // all-day end exclusive
-    transparency: 'opaque',
+    transparency: 'opaque' as const,
     extendedProperties: { private: { [CRM_MARKER_KEY]: CRM_MARKER_VAL, booking_id: bookingId } },
   };
+  if (!startTime) {
+    return { ...base, start: { date: dateStr }, end: { date: addDaysToDateStr(dateStr, 1) } }; // all-day end exclusive
+  }
+  const hhmmss = startTime.length >= 8 ? startTime.slice(0, 8) : `${startTime.slice(0, 5)}:00`;
+  const startDT = `${dateStr}T${hhmmss}+03:00`;
+  const dur = durationHours && durationHours > 0 ? durationHours : 4;
+  const endDT = new Date(new Date(startDT).getTime() + dur * 3_600_000).toISOString();
+  return { ...base, start: { dateTime: startDT, timeZone: TZ }, end: { dateTime: endDT, timeZone: TZ } };
 }
 
 export interface IncomingDay { date: string; start_time: string | null; duration_hours: number | null; }
@@ -188,18 +204,21 @@ async function runConstantineSyncLocked(result: ConstantineSyncResult, boatIds?:
 
       // ── A: yeni CRM bookingleri için "Dolu" blok push et ──
       const toPush = (await sql`
-        SELECT id, date::text AS date FROM bookings
+        SELECT id, date::text AS date, start_time::text AS start_time, duration_hours FROM bookings
         WHERE boat_id = ${boat.id}
           AND date >= CURRENT_DATE AND date <= CURRENT_DATE + ${HORIZON_DAYS}::int
           AND status != 'cancelled' AND approval_status != 'rejected'
           AND (sync_origin IS NULL OR sync_origin = 'crm')
           AND sync_calendar_event_id IS NULL
-      `) as unknown as Array<{ id: string; date: string }>;
+      `) as unknown as Array<{ id: string; date: string; start_time: string | null; duration_hours: string | number | null }>;
       for (const bk of toPush) {
         try {
           const { id: evId } = await createCalendarEvent({
             accessToken, calendarId: calId,
-            event: buildCrmBlockEvent(bk.date.slice(0, 10), bk.id),
+            event: buildCrmBlockEvent(
+              bk.date.slice(0, 10), bk.id, bk.start_time,
+              bk.duration_hours != null ? Number(bk.duration_hours) : null,
+            ),
           });
           await sql`
             UPDATE bookings SET sync_calendar_event_id = ${evId}, sync_origin = 'crm'
