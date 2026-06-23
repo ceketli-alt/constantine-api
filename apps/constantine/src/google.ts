@@ -107,24 +107,6 @@ export interface CalendarEvent {
   extendedProperties?: { private?: Record<string, string>; shared?: Record<string, string> };
 }
 
-export async function listCalendarEvents(opts: {
-  accessToken: string;
-  calendarId: string;
-  timeMin: string;
-  timeMax: string;
-}): Promise<CalendarEvent[]> {
-  const url = new URL(`${GOOGLE_CALENDAR_BASE}/calendars/${encodeURIComponent(opts.calendarId)}/events`);
-  url.searchParams.set('timeMin', opts.timeMin);
-  url.searchParams.set('timeMax', opts.timeMax);
-  url.searchParams.set('singleEvents', 'true');
-  url.searchParams.set('orderBy', 'startTime');
-  url.searchParams.set('maxResults', '250');
-  const r = await fetch(url.toString(), { headers: { Authorization: `Bearer ${opts.accessToken}` } });
-  if (!r.ok) throw new Error(`events.list failed: ${r.status} ${await r.text()}`);
-  const json = await r.json() as { items?: CalendarEvent[] };
-  return json.items ?? [];
-}
-
 /**
  * events.list — TÜM sayfaları gez (nextPageToken). Sync motoru bunu "silinme oracle'ı"
  * olarak kullandığı için eksik sayfa = yanlış withdraw iptali demek; bu yüzden tam liste şart.
@@ -253,9 +235,12 @@ export async function createCalendar(opts: { accessToken: string; summary: strin
   return await r.json() as { id: string };
 }
 
-/** Takvimi bir kullanıcıyla paylaş (ACL kuralı ekle). role: 'reader' | 'writer'. */
-export async function shareCalendar(opts: { accessToken: string; calendarId: string; email: string; role?: 'reader' | 'writer' }): Promise<void> {
-  const r = await fetch(`${GOOGLE_CALENDAR_BASE}/calendars/${encodeURIComponent(opts.calendarId)}/acl`, {
+/** Takvimi bir kullanıcıyla paylaş (ACL kuralı ekle). role: 'reader' | 'writer'.
+ *  sendNotifications: Google'ın paylaşım bildirim e-postasını göndersin mi (default true). */
+export async function shareCalendar(opts: { accessToken: string; calendarId: string; email: string; role?: 'reader' | 'writer'; sendNotifications?: boolean }): Promise<void> {
+  const url = new URL(`${GOOGLE_CALENDAR_BASE}/calendars/${encodeURIComponent(opts.calendarId)}/acl`);
+  url.searchParams.set('sendNotifications', String(opts.sendNotifications ?? true));
+  const r = await fetch(url.toString(), {
     method: 'POST',
     headers: { Authorization: `Bearer ${opts.accessToken}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ role: opts.role ?? 'writer', scope: { type: 'user', value: opts.email } }),
