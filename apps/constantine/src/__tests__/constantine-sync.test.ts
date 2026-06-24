@@ -35,17 +35,34 @@ describe('isCrmBlock', () => {
 });
 
 describe('buildCrmBlockEvent', () => {
-  it('all-day Dolu blok + cy_sync işareti', () => {
+  it('start_time yoksa → all-day Dolu blok + cy_sync işareti', () => {
     const ev = buildCrmBlockEvent('2026-07-10', 'bk-123');
     expect(ev.summary).toBe('Dolu');
     expect(ev.start.date).toBe('2026-07-10');
     expect(ev.end.date).toBe('2026-07-11'); // all-day end exclusive
+    expect(ev.start.dateTime).toBeUndefined();
     expect(ev.transparency).toBe('opaque');
     expect(ev.extendedProperties?.private?.cy_sync).toBe('crm');
     expect(ev.extendedProperties?.private?.booking_id).toBe('bk-123');
   });
+  it('start_time varsa → SAATLİ event (Simon saatleri görür)', () => {
+    const ev = buildCrmBlockEvent('2026-07-10', 'bk-9', '10:00:00', 4);
+    expect(ev.start.dateTime).toBe('2026-07-10T10:00:00+03:00');
+    expect(ev.start.date).toBeUndefined();
+    expect(ev.end.dateTime).toBe('2026-07-10T11:00:00.000Z'); // 10:00+03 = 07:00Z, +4h = 11:00Z
+    expect(ev.summary).toBe('Dolu');
+    expect(ev.extendedProperties?.private?.cy_sync).toBe('crm');
+  });
+  it('HH:MM formatını da kabul eder (saniye tamamlanır)', () => {
+    const ev = buildCrmBlockEvent('2026-07-10', 'bk-9', '14:30', 2);
+    expect(ev.start.dateTime).toBe('2026-07-10T14:30:00+03:00');
+  });
+  it('duration yoksa default 4 saat', () => {
+    const ev = buildCrmBlockEvent('2026-07-10', 'bk-9', '09:00:00', null);
+    expect(ev.end.dateTime).toBe('2026-07-10T10:00:00.000Z'); // 09:00+03=06:00Z +4h=10:00Z
+  });
   it('ürettiği blok isCrmBlock ile kendini tanır (round-trip)', () => {
-    const ev = buildCrmBlockEvent('2026-07-10', 'bk-1') as unknown as CalendarEvent;
+    const ev = buildCrmBlockEvent('2026-07-10', 'bk-1', '12:00:00', 3) as unknown as CalendarEvent;
     expect(isCrmBlock(ev)).toBe(true);
   });
 });

@@ -235,9 +235,12 @@ export async function createCalendar(opts: { accessToken: string; summary: strin
   return await r.json() as { id: string };
 }
 
-/** Takvimi bir kullanıcıyla paylaş (ACL kuralı ekle). role: 'reader' | 'writer'. */
-export async function shareCalendar(opts: { accessToken: string; calendarId: string; email: string; role?: 'reader' | 'writer' }): Promise<void> {
-  const r = await fetch(`${GOOGLE_CALENDAR_BASE}/calendars/${encodeURIComponent(opts.calendarId)}/acl`, {
+/** Takvimi bir kullanıcıyla paylaş (ACL kuralı ekle). role: 'reader' | 'writer'.
+ *  sendNotifications: Google'ın paylaşım bildirim e-postasını göndersin mi (default true). */
+export async function shareCalendar(opts: { accessToken: string; calendarId: string; email: string; role?: 'reader' | 'writer'; sendNotifications?: boolean }): Promise<void> {
+  const url = new URL(`${GOOGLE_CALENDAR_BASE}/calendars/${encodeURIComponent(opts.calendarId)}/acl`);
+  url.searchParams.set('sendNotifications', String(opts.sendNotifications ?? true));
+  const r = await fetch(url.toString(), {
     method: 'POST',
     headers: { Authorization: `Bearer ${opts.accessToken}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ role: opts.role ?? 'writer', scope: { type: 'user', value: opts.email } }),
