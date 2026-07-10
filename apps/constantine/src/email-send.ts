@@ -23,7 +23,7 @@ import type { Context } from 'hono';
 import sanitizeHtml from 'sanitize-html';
 import { sql, withRequestContext } from './db.js';
 import { requireAuth } from './middleware.js';
-import { mailProviderForKind, type MailKind } from './mail/index.js';
+import { mailProviderForKind, outreachProviderForSender, type MailKind } from './mail/index.js';
 import type { MailProvider, SendInput } from './mail/types.js';
 import { resolveSpintax } from './spintax.js';
 import { buildUnsubscribeUrl, buildListUnsubscribeHeaders } from './unsubscribe.js';
@@ -547,7 +547,11 @@ export async function sendEmailCore(
         // campaign_id varsa cold outreach (constantineyachts.online).
         // Yoksa transactional (send.constantineyachts.com) — manual reply, follow-up vs.
         const mailKind: MailKind = input.campaign_id ? 'outreach' : 'transactional';
-        const provider = mailProviderForKind(mailKind);
+        // Outreach'te provider gönderen domaine göre seçilir — her warmup domaini KENDİ Resend
+        // hesabından çıkar (constantineboat/yacht.online ayrı verified hesaplar). Yanlış key = bounce.
+        const provider = mailKind === 'outreach'
+          ? outreachProviderForSender(senderEmail)
+          : mailProviderForKind(mailKind);
 
         const sendResult = await sendWithRetry(sendPayload, provider);
         const resendData = sendResult.data;
