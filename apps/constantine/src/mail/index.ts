@@ -38,17 +38,52 @@ const RESEND_KEY_OUTREACH =
   process.env.RESEND_API_KEY ??
   '';
 
+// Warmup domainleri — her biri AYRI Resend hesabı (reputation izolasyonu, ücretsiz tier).
+// Boş ise güvenli fallback aşağıda outreachProvider'a düşer (cy.online).
+const RESEND_KEY_OUTREACH_BOAT = process.env.RESEND_API_KEY_OUTREACH_BOAT ?? '';
+const RESEND_KEY_OUTREACH_YACHT = process.env.RESEND_API_KEY_OUTREACH_YACHT ?? '';
+
 /** Transactional provider — digest, test mail, dashboard. Default. */
 export const transactionalProvider: MailProvider = new ResendProvider(
   RESEND_KEY_TRANSACTIONAL,
   RESEND_BASE_URL,
 );
 
-/** Outreach provider — cold outreach campaign mesajları. */
+/** Outreach provider — cold outreach campaign mesajları. constantineyachts.online (varsayılan). */
 export const outreachProvider: MailProvider = new ResendProvider(
   RESEND_KEY_OUTREACH,
   RESEND_BASE_URL,
 );
+
+// Warmup domain provider'ları — ayrı Resend hesapları. Key yoksa cy.online'a güvenli fallback
+// (yanlış key ile göndermektense bilinen-verified hesaptan gönder → sessiz bounce yerine tutarlı davranış).
+const outreachProviderBoat: MailProvider = RESEND_KEY_OUTREACH_BOAT
+  ? new ResendProvider(RESEND_KEY_OUTREACH_BOAT, RESEND_BASE_URL)
+  : outreachProvider;
+const outreachProviderYacht: MailProvider = RESEND_KEY_OUTREACH_YACHT
+  ? new ResendProvider(RESEND_KEY_OUTREACH_YACHT, RESEND_BASE_URL)
+  : outreachProvider;
+
+/**
+ * Sender domain → doğru Resend hesabı.
+ * Her Resend key SADECE kendi domainini verified tanır; yanlış key → "domain is not verified" bounce.
+ * Bu yüzden outreach gönderiminde provider'ı mail tipine DEĞİL, gönderen domaine göre seçiyoruz.
+ * Bilinmeyen domain → varsayılan outreachProvider (cy.online).
+ */
+const OUTREACH_PROVIDER_BY_DOMAIN: Record<string, MailProvider> = {
+  'constantineyachts.online': outreachProvider,
+  'constantineboat.online': outreachProviderBoat,
+  'constantineyacht.online': outreachProviderYacht,
+};
+
+/**
+ * Outreach (kampanya) gönderiminde gönderen adrese göre doğru provider'ı verir.
+ *   const provider = outreachProviderForSender('mert@constantineboat.online'); // → boat hesabı
+ */
+export function outreachProviderForSender(fromEmail: string): MailProvider {
+  const domain = fromEmail.split('@')[1]?.toLowerCase().trim() ?? '';
+  return OUTREACH_PROVIDER_BY_DOMAIN[domain] ?? outreachProvider;
+}
 
 /**
  * Backward-compat singleton — mevcut kodun çoğu bu kullanıyor.
