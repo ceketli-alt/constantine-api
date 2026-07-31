@@ -17,29 +17,31 @@ import 'dotenv/config';
 import { sql } from '../src/db.js';
 import { sendEmailCore } from '../src/email-send.js';
 
-// Instantly Inbox Placement test (2026-06-02 oluşturuldu)
-const TRACKING_CODE = 'ptid_HWWCpbKpaQ5N9qrDwoAGp';
+// GlockApps Manual Test "DMC Phase 2 Microsoft mert@" (2026-06-22) — 30 seed, Gmail+Outlook+Hotmail+EOP
+const TRACKING_CODE = 'id: 2026-06-22-13:56:11:341t';
 const SEED_INBOXES = [
-  'ethan@govynor.com','andrew@theprosperbloom.com','ava@thezenithorbit.com','benjamin@theelevarapeak.com',
-  'brandon@thezenithverve.com','chloe@theprosperhive.com','christopher@thezenithharbor.com','daniel@theascendvanta.com',
-  'emily@thezenithnest.com','ethan@theprospermint.com','grace@thezenithwavex.com','hannah@thethrivemotive.com',
-  'isabella@thezenithriselab.com','james@theprospernova.com','jonathan@theprosperloom.com','joseph@thegrowthnectar.com',
-  'kevin@thegrowthcatalyx.com','lily@thegrowthhorizonx.com','madison@thethrivevertex.com','matthew@thethrivequarry.com',
-  'michael@thegrowthlattice.com','natalie@theprospersphere.com','nicholas@theprosperdrift.com','olivia@theprospervibe.com',
-  'ryan@thezenithroot.com','samantha@thethrivefusion.com','sophia@theascendraflow.com','tyler@thethrivecascade.com',
-  'victoria@theprospercircuit.com','zoe@thezenithcradle.com',
-  'ainsley@cleanraysolutions.com','alexis@coresyntechnologies.com','amy@velprimesolutions.com',
-  'blair@clearcoreenterprises.com','brian.l@nexbrighttechnologies.com','bridget@purecoreenterprise.com',
-  'caitlin@nextnovatechnologies.com','daisy@cleanedgeenterprise.com','david.h@firstnovagroup.com',
-  'emily.h@brightedgeenterprise.com','james.c@clearnexttechnologies.com','jessica.c@clearveltechnologies.com',
-  'kayla@greenflowenterprise.com','kevin.s@firstcoreenterprise.com','laura.s@greenprimegroup.com',
-  'michael.b@pureflowenterprises.com','ryan.m@clearflowenterprise.com','sable@velnexsolutions.com',
-  'sarah.w@purenextsolutions.com','sarah@firstclapgroup.com',
+  // Gmail (10)
+  'cierawilliamsonwq@gmail.com','dorothypp564@gmail.com','edwardmflannery@gmail.com','jimmyrushkerk@gmail.com',
+  'joanyedonald@gmail.com','earleenwhudson@gmail.com','melissaamy5465@gmail.com','kathleentratliff@gmail.com',
+  'georgewsack@gmail.com','jerrybrucedath@gmail.com',
+  // Outlook (7)
+  'genryjobson@outlook.com','jamiecrabson@outlook.com','shannongreerf@outlook.com','jeremycworley@outlook.com',
+  'marionrblack@outlook.com','williegarciaee@outlook.com','sinkerfiil@outlook.com',
+  // Hotmail (4)
+  'phhhillipwiligams@hotmail.com','justinjacobsdj@hotmail.com','charlettevus@hotmail.com','sheilasmithse@hotmail.com',
+  // EOP / kurumsal (4)
+  'elizabeaver@auth.glockdb.com','paul@userflowhq.com','alfredohoffman@fastdirectorysubmitter.com','allanb@glockapps.awsapps.com',
+  // Yahoo/AOL/iCloud (5)
+  'leoefraser@yahoo.com','luanajortega@yahoo.com','dannakbond@aol.com','candacechall@aol.com','romanespor11@icloud.com',
 ];
 
 const DMC_TEMPLATE_ID = '3a32c3a6-01c6-4d3c-a89d-2226e0df242b';
-const OUTREACH_SENDER = 'outreach@constantineyachts.online';
-const SEED_CAMPAIGN_NAME = 'ZZ INBOX PLACEMENT 2026-06-02 (silinebilir)';
+// SEND_AS env ile gönderici override (mert@ vs outreach@ karşılaştırması). Kampanya adı sender-spesifik → dedupe çakışmaz.
+const OUTREACH_SENDER = (process.env.SEND_AS ?? 'outreach@constantineyachts.online').trim();
+const SENDER_TAG = OUTREACH_SENDER.split('@')[0];
+const SEED_CAMPAIGN_NAME = `ZZ INBOX PLACEMENT [${SENDER_TAG}] (silinebilir)`;
+// SEND_GAP_MS env: gönderimler arası bekleme (ms). 30 seed × 240000 (4dk) ≈ 2 saate yayar. Default 800 (rate-limit).
+const SEND_GAP_MS = Number(process.env.SEND_GAP_MS ?? 800);
 const SEED_TAG = 'zz-placement-test';
 const REP_NAME = 'Mert Ödemiş';
 
@@ -203,7 +205,7 @@ async function main() {
       fail++;
       console.log(`  ✗ ${lead.email} → EXCEPTION: ${e?.message}`);
     }
-    await sleep(800); // Resend rate-limit (5/s) — güvenli
+    await sleep(SEND_GAP_MS); // SEND_GAP_MS ile ayarlanır (default 800; 2-saate-yay için 240000)
   }
 
   console.log(`\n=== ${ok} gönderildi, ${fail} hata ===`);
