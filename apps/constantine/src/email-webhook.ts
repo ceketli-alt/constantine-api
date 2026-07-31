@@ -19,7 +19,13 @@ import type { Context } from 'hono';
 import crypto from 'node:crypto';
 import { sql } from './db.js';
 
-const RESEND_WEBHOOK_SECRET = process.env.RESEND_WEBHOOK_SECRET || '';
+// Her Resend hesabının KENDİ svix imza secret'ı var (cy.online + boat + yacht warmup hesapları).
+// Gelen webhook'ta hangi hesaptan geldiği bilgisi yok → imza tüm secret'lara karşı denenir.
+const RESEND_WEBHOOK_SECRETS = [
+  process.env.RESEND_WEBHOOK_SECRET,
+  process.env.RESEND_WEBHOOK_SECRET_BOAT,
+  process.env.RESEND_WEBHOOK_SECRET_YACHT,
+].filter((s): s is string => typeof s === 'string' && s.startsWith('whsec_'));
 
 /**
  * Resend / Svix HMAC-SHA256 signature verification
@@ -67,11 +73,13 @@ export async function handleResendWebhook(c: Context): Promise<Response> {
   const svixTimestamp = c.req.header('svix-timestamp') ?? '';
   const svixSignature = c.req.header('svix-signature') ?? '';
 
-  if (!RESEND_WEBHOOK_SECRET) {
-    console.error('[email-webhook] RESEND_WEBHOOK_SECRET not configured — rejecting webhook (fail-closed)');
+  if (RESEND_WEBHOOK_SECRETS.length === 0) {
+    console.error('[email-webhook] RESEND_WEBHOOK_SECRET* not configured — rejecting webhook (fail-closed)');
     return c.json({ error: 'webhook_not_configured' }, 503);
   }
-  const ok = verifySvixSignature(raw, { id: svixId, timestamp: svixTimestamp, signature: svixSignature }, RESEND_WEBHOOK_SECRET);
+  const ok = RESEND_WEBHOOK_SECRETS.some((secret) =>
+    verifySvixSignature(raw, { id: svixId, timestamp: svixTimestamp, signature: svixSignature }, secret),
+  );
   if (!ok) {
     console.warn('[email-webhook] Invalid signature', { svixId });
     return c.json({ error: 'invalid_signature' }, 401);
