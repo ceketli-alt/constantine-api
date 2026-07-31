@@ -22,16 +22,25 @@ import crypto from 'node:crypto';
 import { sql } from './db.js';
 
 const API_BASE_URL = process.env.API_BASE_URL || 'https://api.constantineyachts.com';
-const UNSUB_SECRET =
+// İmzalama (yeni linkler) DAİMA primary secret ile. Decouple (2026-06-30): artık özel
+// UNSUBSCRIBE_SECRET tercih edilir; yoksa eski davranışa (RESEND_WEBHOOK_SECRET / hardcoded) düşer.
+const PRIMARY_SECRET =
   process.env.UNSUBSCRIBE_SECRET || process.env.RESEND_WEBHOOK_SECRET || 'constantine-unsub-v1';
 
-/** HMAC-SHA256(lead:channel) → 32-hex token. email-send.ts ve bu handler aynı fonksiyonu kullanır. */
+// Doğrulama-only fallback: GEÇMİŞTE gönderilmiş maillerdeki one-click linkler bu secret'larla
+// imzalanmış olabilir. Primary'yi değiştirince/ayırınca eski linkler KIRILMASIN diye verify
+// sırasında bunlar da denenir. İmzalamada KULLANILMAZ.
+const LEGACY_SECRETS: string[] = [process.env.RESEND_WEBHOOK_SECRET, 'constantine-unsub-v1'].filter(
+  (s): s is string => !!s && s !== PRIMARY_SECRET,
+);
+
+function hmacToken(secret: string, leadId: string, channel: string): string {
+  return crypto.createHmac('sha256', secret).update(`${leadId}:${channel}`).digest('hex').slice(0, 32);
+}
+
+/** HMAC-SHA256(lead:channel) → 32-hex token. İmzalama daima primary secret ile yapılır. */
 export function unsubscribeToken(leadId: string, channel: string): string {
-  return crypto
-    .createHmac('sha256', UNSUB_SECRET)
-    .update(`${leadId}:${channel}`)
-    .digest('hex')
-    .slice(0, 32);
+  return hmacToken(PRIMARY_SECRET, leadId, channel);
 }
 
 /** Footer + List-Unsubscribe header için tokenli public URL üretir. */
@@ -51,14 +60,22 @@ export function buildListUnsubscribeHeaders(leadId: string, channel: string = 'e
   };
 }
 
+/**
+ * Token doğrulama — primary VEYA legacy secret'ların herhangi biriyle eşleşirse geçerli.
+ * Böylece secret ayrımı/rotasyonu sonrası geçmişte gönderilmiş one-click linkler çalışmaya devam eder.
+ */
 function tokenValid(leadId: string, channel: string, token: string | undefined | null): boolean {
   if (!token) return false;
-  const expected = unsubscribeToken(leadId, channel);
-  try {
-    return crypto.timingSafeEqual(Buffer.from(token), Buffer.from(expected));
-  } catch {
-    return false;
+  for (const secret of [PRIMARY_SECRET, ...LEGACY_SECRETS]) {
+    const expected = hmacToken(secret, leadId, channel);
+    if (token.length !== expected.length) continue;
+    try {
+      if (crypto.timingSafeEqual(Buffer.from(token), Buffer.from(expected))) return true;
+    } catch {
+      /* sonraki secret'ı dene */
+    }
   }
+  return false;
 }
 
 /** Lead'in tüm bilinen email adreslerini topla (şirket-seviyesi opt-out için). */
