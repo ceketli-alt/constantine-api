@@ -10,6 +10,7 @@
  *   /storage/v1/...  → (Faz 2: lokal disk + nginx)
  */
 import 'dotenv/config';
+import { Server as HttpServer } from 'node:http'; // kapanışta soket drenajı için (bkz. shutdown)
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
@@ -537,7 +538,7 @@ app.onError((err, c) => {
   return c.json({ message: err.message, code: 'internal_error' }, 500);
 });
 
-serve({ fetch: app.fetch, port: PORT, hostname: '127.0.0.1' }, ({ port, address }) => {
+const server = serve({ fetch: app.fetch, port: PORT, hostname: '127.0.0.1' }, ({ port, address }) => {
   console.log(`✓ @api/concierge ${address}:${port}'da dinliyor`);
   console.log(`  Health: http://${address}:${port}/health`);
   console.log(`  REST  : http://${address}:${port}/rest/v1/<table>`);
@@ -547,8 +548,58 @@ serve({ fetch: app.fetch, port: PORT, hostname: '127.0.0.1' }, ({ port, address 
 // In-process background workers (env-gated)
 startNotificationsRunner();
 
-process.on('SIGTERM', async () => {
-  console.log('SIGTERM, kapanıyor...');
-  await sql.end();
-  process.exit(0);
-});
+// --- Düzgün kapanış -------------------------------------------------------
+// NEDEN (2026-07-31 ölçümü): buradaki handler 336 saattir HİÇ ÇALIŞMADI.
+// PM2 `pnpm dev`i süpervize ediyordu, gerçek dinleyici torunun torunuydu
+// (pnpm→sh→tsx watch→node); sinyal ona ulaşmıyordu. PM2 tarafı düzeltildi
+// (ecosystem.config.cjs artık node'u DOĞRUDAN çalıştırıyor).
+//
+// İKİNCİ VE AYRI HATA — SIGTERM YETMİYOR: PM2 7.0.1 kapatırken SIGTERM değil
+// SIGINT gönderiyor (constants.js:106 → PM2_KILL_SIGNAL || 'SIGINT') ve bu
+// sürümde per-app `kill_signal` alanı okunmuyor. Yani yalnız SIGTERM dinleyen
+// bir handler PM2 altında yine hiç çalışmaz: süreç Node'un varsayılan
+// davranışıyla anında ölür. Bu tam olarak bu dosyayla ölçüldü (spare port 4099,
+// NOTIFICATIONS_DISPATCH_ENABLED=false): SIGINT'te süreç öldü, tek satır
+// kapanış logu basılmadı. Bu yüzden İKİ sinyal de karşılanıyor.
+let shuttingDown = false;
+async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) return; // ikinci sinyal ilkini bozmasın
+  shuttingDown = true;
+  console.log(`[shutdown] ${signal} — yeni bağlantı kabul edilmiyor`);
+
+  // Asılı bir bağlantı kapanışı sonsuza dek bekletmesin: PM2'nin kill_timeout'u
+  // (12sn) devreye girmeden ÖNCE kendimiz çıkarız, ki port SIGKILL'e kalmadan
+  // serbest kalsın.
+  const guard = setTimeout(() => {
+    console.error('[shutdown] 10sn içinde kapanmadı — zorla çıkılıyor');
+    process.exit(1);
+  }, 10_000);
+  guard.unref();
+
+  try {
+    await new Promise<void>((resolve) => {
+      server.close(() => resolve());
+      // DİKKAT: server.close() TEK BAŞINA YETMEZ. Açık keep-alive soketi kaldığı
+      // sürece close() callback'i çağırmaz; her kapanış yukarıdaki 10sn guard'a
+      // düşüp exit(1) ile biterdi. Boştaki soketleri hemen kapat, 3sn sonra
+      // hâlâ uçuşta olan istek varsa onu da kes.
+      // instanceof şart: serve() dönüş tipi ServerType = Server | Http2Server |
+      // Http2SecureServer ve bu metodlar yalnız http.Server'da var (opsiyonel
+      // çağrı tsc'yi geçmez). Burada http2 seçeneği verilmediği için gerçek tip
+      // zaten http.Server.
+      if (server instanceof HttpServer) {
+        server.closeIdleConnections();
+        setTimeout(() => server.closeAllConnections(), 3_000).unref();
+      }
+    });
+
+    await sql.end();
+    console.log('[shutdown] temiz çıkış');
+    process.exit(0);
+  } catch (e) {
+    console.error('[shutdown] kapanışta hata', e);
+    process.exit(1);
+  }
+}
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));

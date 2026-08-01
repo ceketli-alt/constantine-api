@@ -10,3 +10,6 @@ dist/
 
 # Playwright tarayıcı binaryleri — runtime gerekli, repoya girmemeli (641MB)
 .playwright-browsers/
+
+# Claude Code yerel durumu — settings.local.json + worktree checkout'ları (5.4MB, makineye özel)
+.claude/
