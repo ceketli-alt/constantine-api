@@ -24,6 +24,18 @@ export interface GoogleTokenResponse {
   id_token?: string;
 }
 
+/**
+ * Refresh token KALICI olarak geçersiz (kullanıcı iptal etti / süresi doldu).
+ * Google bunu 400 `invalid_grant` ile bildirir; yeniden denemek asla düzeltmez —
+ * çağıran taraf bağlantıyı kapatıp yeniden yetkilendirme istemeli.
+ */
+export class GoogleAuthRevokedError extends Error {
+  constructor(detail: string) {
+    super(`refresh failed: ${detail}`);
+    this.name = 'GoogleAuthRevokedError';
+  }
+}
+
 export async function refreshAccessToken(refreshToken: string): Promise<GoogleTokenResponse> {
   const body = new URLSearchParams({
     client_id: getEnv('GOOGLE_CLIENT_ID'),
@@ -38,6 +50,9 @@ export async function refreshAccessToken(refreshToken: string): Promise<GoogleTo
   });
   if (!r.ok) {
     const err = await r.text();
+    if (r.status === 400 && err.includes('invalid_grant')) {
+      throw new GoogleAuthRevokedError(`${r.status} ${err}`);
+    }
     throw new Error(`refresh failed: ${r.status} ${err}`);
   }
   return await r.json() as GoogleTokenResponse;
