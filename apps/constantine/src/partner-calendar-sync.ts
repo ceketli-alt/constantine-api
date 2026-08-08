@@ -11,7 +11,7 @@
 import type { Context } from 'hono';
 import { sql } from './db.js';
 import { requireAuth } from './middleware.js';
-import { getAccessTokenForBoat, freeBusyQuery } from './google.js';
+import { getAccessTokenForBoat, freeBusyQuery, GoogleAuthRevokedError } from './google.js';
 import { isoToLocalParts } from './google-calendar.js';
 
 const TZ = 'Europe/Istanbul';
@@ -113,6 +113,28 @@ export async function runPartnerCalendarSync(boatIds?: string[]): Promise<Partne
       result.synced++;
       result.slots += rows.length;
     } catch (err: any) {
+      if (err instanceof GoogleAuthRevokedError) {
+        // invalid_grant kalıcıdır: her 10 dk yeniden denemek düzelmez, sadece log
+        // ve Google kota yakar. Bağlantıyı kapat (SELECT filtresi bu tekneyi artık
+        // seçmez; UI'dan yeniden bağlanınca OAuth akışı flag'i tekrar açar) ve son
+        // başarılı sync'ten kalan bayat "Dolu" bloklarını temizle — acente portalı
+        // haftalar önceki cache'i canlı müsaitlik gibi göstermesin.
+        try {
+          const deleted = await sql`
+            DELETE FROM boat_busy_slots
+            WHERE boat_id = ${boat.id} AND source = 'google' AND date >= CURRENT_DATE
+          `;
+          await sql`UPDATE boats SET google_calendar_connected = false WHERE id = ${boat.id}`;
+          console.error(
+            `[partner-sync] ${boat.name}: Google yetkisi kalıcı geçersiz (invalid_grant) — ` +
+            `bağlantı kapatıldı, ${deleted.count} bayat slot silindi. Ayarlar → Tekneler'den yeniden bağlanmalı.`
+          );
+        } catch (cleanupErr: any) {
+          console.error(`[partner-sync] ${boat.name}: revoked-cleanup başarısız:`, cleanupErr?.message);
+        }
+        result.errors.push({ boat_id: boat.id, boat_name: boat.name, error: 'google_auth_revoked — yeniden bağlantı gerekiyor' });
+        continue;
+      }
       console.error(`[partner-sync] ${boat.name} failed:`, err?.message);
       result.errors.push({ boat_id: boat.id, boat_name: boat.name, error: err?.message ?? String(err) });
     }
