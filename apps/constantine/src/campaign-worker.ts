@@ -45,6 +45,7 @@ const FREEMAIL = new Set<string>([
 
 let tickHandle: NodeJS.Timeout | null = null;
 let running = false;
+let skippedTicks = 0; // uzun tick sürerken atlanan dakika-tick sayısı (log özetleme için)
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -633,8 +634,18 @@ async function processCampaign(campaign: CampaignRow, fallbackUserId: string | n
 
 async function tick(): Promise<void> {
   if (running) {
-    console.warn('[worker] previous tick still running, skipping');
+    // Pacing'li tick saatler sürebilir (insansı gönderim araları) — her dakika ayrı
+    // satır basmak error logu boğuyordu (561 satır/gün; 2026-08-03 healthcheck'inde
+    // gerçek hataları aramayı zorlaştırdı). İlk atlamada ve ~30 dk'da bir özetle.
+    skippedTicks++;
+    if (skippedTicks === 1 || skippedTicks % 30 === 0) {
+      console.warn(`[worker] previous tick still running, skipping (${skippedTicks} dk'dır sürüyor)`);
+    }
     return;
+  }
+  if (skippedTicks > 0) {
+    console.log(`[worker] uzun tick bitti (${skippedTicks} dk boyunca atlanan tick'ler normale döndü)`);
+    skippedTicks = 0;
   }
   running = true;
   try {
