@@ -46,6 +46,15 @@ const CAMPAIGNS = [
       AND NOT EXISTS (SELECT 1 FROM free_email_domains f
         WHERE lower(split_part(l.primary_contact_email,'@',2)) = f.domain)`,
   },
+  {
+    id: 'cf291a24-25e5-4b68-98a4-6a621f425513',
+    label: 'IST-ACENTE (site kazısı)',
+    lowWater: 25,
+    batch: 200,
+    // Bu havuzda 'email-valid' etiketi YOK — adresler siteden kazındı,
+    // doğrulamayı bu scriptin kendi NeverBounce adımı yapıyor.
+    poolFilter: sql`'ist-yeni' = ANY(l.tags)`,
+  },
 ];
 
 const log = (m) => {
