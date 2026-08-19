@@ -296,6 +296,16 @@ export async function handleCalendarImport(c: Context): Promise<Response> {
         continue;
       }
 
+      // ⚠️ PARA (2026-08-19 denetimi): `bookings` hem orijinal tutarı (total_price,
+      // our_share) hem TRY aynasını (total_price_try, our_share_try) taşıyor ve
+      // ikisini senkron tutan HİÇBİR trigger yok — TRY kolonlarının DEFAULT'u 0.
+      // Bu INSERT currency/exchange_rate/*_try alanlarını hiç yazmıyordu, dolayısıyla
+      // takvimden gelen her ücretli rezervasyon raporlara ₺0 olarak giriyordu:
+      // daily-digest SUM(total_price_try), settlement gross_revenue_try ve
+      // Calendar.tsx'teki fmtTRY hep sıfır görüyordu. Ölçülen etki: 30 kayıt,
+      // ₺212.696,86 görünmez ciro ve buna bağlı yanlış ortak mutabakatı.
+      // Takvim içe aktarımının para birimi kavramı yok — tutarlar TRY girilir,
+      // dolayısıyla kur 1 ve TRY aynası tutarın kendisidir.
       const inserted = await sql`
         INSERT INTO bookings (
           date, guest_name, contact,
@@ -303,6 +313,7 @@ export async function handleCalendarImport(c: Context): Promise<Response> {
           product_id, channel_id, package_id, boat_id,
           start_time, duration_hours,
           our_share, total_price,
+          currency, exchange_rate, our_share_try, total_price_try,
           status, payment_status, notes,
           created_by, approval_status, approved_by, approved_at,
           google_event_id, google_calendar_id, google_synced_at, google_sync_source
@@ -312,6 +323,7 @@ export async function handleCalendarImport(c: Context): Promise<Response> {
           ${row.product_id}, ${row.channel_id}, ${row.package_id}, ${row.boat_id},
           ${row.start_time}, ${row.duration_hours},
           ${row.our_share || 0}, ${row.total_price || 0},
+          'TRY', 1, ${row.our_share || 0}, ${row.total_price || 0},
           'confirmed', 'pending', ${row.notes},
           ${auth.userId}, 'approved', ${auth.userId}, now(),
           ${row.google_event_id}, ${row.google_calendar_id}, now(), 'pulled'

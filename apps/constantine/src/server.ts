@@ -274,6 +274,16 @@ app.post('/rest/v1/rpc/:fn', async (c) => {
   const fn = c.req.param('fn');
   if (!RPC_RE.test(fn)) return c.json({ message: 'invalid rpc', code: 'bad_request' }, 400);
   const auth = requireAuth(c);
+  // 2026-08-19 denetimi: `requireAuth` çağrılıyordu ama DÖNÜŞ DEĞERİ HİÇ KONTROL
+  // EDİLMİYORDU — yani anonim bir istek public şemasındaki her fonksiyonu
+  // çalıştırabiliyordu. Hassas olanların çoğu kendi içinde `auth.uid()` kontrol
+  // ettiği için reddediyordu, ama hepsi değil: `adjust_extra_stock` (SECURITY
+  // DEFINER, hiçbir yetki kontrolü yok — stok miktarını değiştirip user_id=NULL
+  // hareket satırı yazıyor) ve `notify_unique` (herhangi bir kullanıcının bildirim
+  // ziline rastgele içerik enjekte edilebiliyordu) korumasızdı.
+  // Frontend'deki TÜM rpc çağrıları giriş arkasında (agency portalı ve kaptan
+  // onboarding sayfaları RPC kullanmıyor, kendi tokenli fonksiyon uçlarını kullanıyor).
+  if (!auth) return c.json({ message: 'Auth gerek', code: 'unauthorized' }, 401);
   let body: Record<string, any> = {};
   try { body = await c.req.json(); } catch {}
   const params = body && typeof body === 'object' ? body : {};
