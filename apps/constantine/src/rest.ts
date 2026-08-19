@@ -24,8 +24,14 @@ import { sql, withRequestContext } from './db.js';
 import { parseQuery, buildSelectSQL, buildCountSQL, buildInsertSQL, buildPatchSQL, buildDeleteSQL } from './pgrst-parser.js';
 import { checkTableAccess, requireAuth } from './middleware.js';
 
+// DİKKAT: buraya SADECE içeriği herkese açık olabilecek tablolar girer.
+// `agency_tokens` 2026-08-19'da BURADAN ÇIKARILDI: satırlarının kendisi kimlik
+// bilgisiydi (acente portalının tek anahtarı) ve tablo internete auth'suz açıktı —
+// `curl .../rest/v1/agency_tokens` 7 token'ı düz metin döndürüyordu, hiçbiri de
+// süresi dolmuyordu (expires_at NULL). Token'ları okuyan tek yüzey giriş arkasındaki
+// Ayarlar → Acenteler paneli; o `authenticated` olarak okumaya devam ediyor.
 const PUBLIC_TABLES_VIEW = new Set([
-  'public_boats', 'agency_tokens',
+  'public_boats',
 ]);
 
 /**
