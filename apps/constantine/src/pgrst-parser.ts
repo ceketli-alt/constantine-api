@@ -244,8 +244,24 @@ function buildSingleFilter(f: ParsedFilter, params: unknown[]): string {
     case 'like': frag = `${col} LIKE $${params.push(f.value)}`; break;
     case 'ilike': frag = `${col} ILIKE $${params.push(f.value)}`; break;
     case 'is':
+      // ⚠️ SQL ENJEKSİYONU DÜZELTMESİ (2026-08-19 denetimi).
+      // Buradaki eski `else frag = \`${col} IS ${f.value}\`` dalı, switch içindeki TEK
+      // yerdi ki kullanıcı değerini parametre yerine SQL METNİNE basıyordu.
+      // parseFilterValue yalnız 'null'/'true'/'false' dizgilerini çeviriyor; başka her
+      // şey ham dizgi olarak buraya geliyordu. Sonuç, ölçülen çıktı:
+      //   ?id=is.null;SELECT 1;--
+      //   → SELECT * FROM "agency_tokens" WHERE "id" IS null;SELECT 1;--   params=[]
+      // params BOŞ kaldığı için postgres.js *simple protocol*'e düşüyor ve bu protokol
+      // ZİNCİRLENMİŞ komutlara izin veriyor; DB rolü tabloların sahibi ve BYPASSRLS
+      // taşıdığı için etki tam yetkiye eşitti.
+      //
+      // `IS` operandı bir SQL anahtar kelimesidir — parametre olarak gönderilemez,
+      // bu yüzden metne yazılmak ZORUNDA. Tek güvenli yol katı beyaz liste:
       if (f.value === null) frag = `${col} IS NULL`;
-      else frag = `${col} IS ${f.value}`;
+      else if (f.value === true) frag = `${col} IS TRUE`;
+      else if (f.value === false) frag = `${col} IS FALSE`;
+      else if (f.value === 'unknown') frag = `${col} IS UNKNOWN`;
+      else throw new Error("is operatörü yalnız null, true, false veya unknown kabul eder");
       break;
     case 'in':
       if (Array.isArray(f.value)) {

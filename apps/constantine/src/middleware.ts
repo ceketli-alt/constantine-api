@@ -80,7 +80,9 @@ export const authnMiddleware: MiddlewareHandler = async (c, next) => {
  *  anon → sadece public_boats benzeri public view'lara okuma.
  *  Daha sıkı policy migration'lardan port edilebilir.
  */
-const ANON_READ_TABLES = new Set(['agency_tokens', 'public_boats']);
+// `agency_tokens` 2026-08-19'da çıkarıldı — bkz. rest.ts PUBLIC_TABLES_VIEW yorumu.
+// Satırları acente portalının kimlik bilgisiydi ve anonim okumaya açıktı.
+const ANON_READ_TABLES = new Set(['public_boats']);
 const SERVICE_ROLE_ALL = true;
 
 export function checkTableAccess(table: string, op: 'read' | 'write', auth?: AuthContext): { ok: boolean; reason?: string } {

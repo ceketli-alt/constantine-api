@@ -305,6 +305,13 @@ async function processFollowUps(
 
   for (const t of due) {
     if (budget <= 0) break;
+    // Pencere kapandıysa batch'in ORTASINDA da dur. (Gap 15-22 dk olduğu için 10'luk bir
+    // batch ~3 saat sürüyordu; 16:50'de başlayan batch 19:55'e kadar mail atıyordu —
+    // pencere yalnız processCampaign girişinde bakılıyordu. Kalanlar sonraki güne kalır.)
+    if (!isWithinSendWindow(new Date(), campaign.send_window_start, campaign.send_window_end, campaign.send_days, SEND_TZ)) {
+      console.log(`[worker] campaign ${campaign.id}: gonderim penceresi kapandi, batch durduruldu`);
+      break;
+    }
     const nextStep = (t.sequence_step ?? 0) + 1; // gönderilecek takip (1-based)
     const stepCfg = steps[nextStep - 1];          // steps array 0-based
     if (!stepCfg || !stepCfg.template_id) {
@@ -407,6 +414,13 @@ async function processInitials(
 
   let sentCount = 0;
   for (const target of queuedRows) {
+    // Pencere kapandıysa batch'in ORTASINDA da dur. (Gap 15-22 dk olduğu için 10'luk bir
+    // batch ~3 saat sürüyordu; 16:50'de başlayan batch 19:55'e kadar mail atıyordu —
+    // pencere yalnız processCampaign girişinde bakılıyordu. Kalanlar sonraki güne kalır.)
+    if (!isWithinSendWindow(new Date(), campaign.send_window_start, campaign.send_window_end, campaign.send_days, SEND_TZ)) {
+      console.log(`[worker] campaign ${campaign.id}: gonderim penceresi kapandi, batch durduruldu`);
+      break;
+    }
     let overrideTo: string | undefined;
     if (targetRole) {
       const sm = (target.source_meta ?? {}) as Record<string, unknown>;

@@ -24,8 +24,14 @@ import { sql, withRequestContext } from './db.js';
 import { parseQuery, buildSelectSQL, buildCountSQL, buildInsertSQL, buildPatchSQL, buildDeleteSQL } from './pgrst-parser.js';
 import { checkTableAccess, requireAuth } from './middleware.js';
 
+// DİKKAT: buraya SADECE içeriği herkese açık olabilecek tablolar girer.
+// `agency_tokens` 2026-08-19'da BURADAN ÇIKARILDI: satırlarının kendisi kimlik
+// bilgisiydi (acente portalının tek anahtarı) ve tablo internete auth'suz açıktı —
+// `curl .../rest/v1/agency_tokens` 7 token'ı düz metin döndürüyordu, hiçbiri de
+// süresi dolmuyordu (expires_at NULL). Token'ları okuyan tek yüzey giriş arkasındaki
+// Ayarlar → Acenteler paneli; o `authenticated` olarak okumaya devam ediyor.
 const PUBLIC_TABLES_VIEW = new Set([
-  'public_boats', 'agency_tokens',
+  'public_boats',
 ]);
 
 /**
@@ -77,17 +83,24 @@ export async function handleRest(c: Context, method: string, table: string): Pro
     jwt: auth?.raw,
   };
 
+  // NOT (2026-08-19): aşağıdaki tüm `.unsafe(...)` çağrıları `{ simple: false }` taşır.
+  // postgres.js protokolü şöyle seçiyor: `simple = 'simple' in options ? options.simple
+  // : args.length === 0` — yani PARAMETRESİZ bir sorgu otomatik olarak *simple protocol*
+  // ile gidiyordu ve o protokol ZİNCİRLENMİŞ komutlara ("...; DROP ...") izin verir.
+  // Asıl açık pgrst-parser'daki `is` dalıydı ve orada kapatıldı; bu ikinci katman,
+  // ileride benzer bir enterpolasyon hatası olursa tek bir istekte birden fazla
+  // komut çalıştırılmasını PROTOKOL düzeyinde imkânsız kılar.
   try {
     if (method === 'GET' || method === 'HEAD') {
       return await withRequestContext(ctx, async (tx) => {
         const params: unknown[] = [];
         const { sqlText } = buildSelectSQL(table, pq, params);
-        const rows = await (tx as any).unsafe(sqlText, params);
+        const rows = await (tx as any).unsafe(sqlText, params, { simple: false });
         let total: number | undefined;
         if (countExact) {
           const cparams: unknown[] = [];
           const { sqlText: countText } = buildCountSQL(table, pq, cparams);
-          const cres = await (tx as any).unsafe(countText, cparams);
+          const cres = await (tx as any).unsafe(countText, cparams, { simple: false });
           total = Number(cres[0]?.count ?? 0);
         }
         const headers: Record<string, string> = {
@@ -116,7 +129,7 @@ export async function handleRest(c: Context, method: string, table: string): Pro
       return await withRequestContext(ctx, async (tx) => {
         const params: unknown[] = [];
         const { sqlText } = buildInsertSQL(table, rows, params, prefer.includes('resolution=ignore-duplicates') ? 'ignore' : undefined);
-        const inserted = await (tx as any).unsafe(sqlText, params);
+        const inserted = await (tx as any).unsafe(sqlText, params, { simple: false });
         // PostgREST: INSERT → 201 Created. Body null değil; representation yoksa boş array konvansiyonu.
         // Not: 201 null-body status değil, '' yerine null da kabul olur ama '[]' supabase-js client
         // .single()/array beklentilerine daha az sürpriz.
@@ -140,7 +153,7 @@ export async function handleRest(c: Context, method: string, table: string): Pro
       return await withRequestContext(ctx, async (tx) => {
         const params: unknown[] = [];
         const { sqlText } = buildPatchSQL(table, pq, body, params);
-        const updated = await (tx as any).unsafe(sqlText, params);
+        const updated = await (tx as any).unsafe(sqlText, params, { simple: false });
         // Fetch spec: 204 No Content MUST have null body. '' bile undici Response constructor'da
         // TypeError atar. representation yoksa null body + 204 dön.
         if (!returnRepresentation) {
@@ -161,7 +174,7 @@ export async function handleRest(c: Context, method: string, table: string): Pro
       return await withRequestContext(ctx, async (tx) => {
         const params: unknown[] = [];
         const { sqlText } = buildDeleteSQL(table, pq, params);
-        const deleted = await (tx as any).unsafe(sqlText, params);
+        const deleted = await (tx as any).unsafe(sqlText, params, { simple: false });
         if (!returnRepresentation) {
           return new Response(null, { status: 204 });
         }
