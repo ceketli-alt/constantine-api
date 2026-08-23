@@ -132,6 +132,7 @@ interface CampaignRow {
   send_days: number[] | null;       // integer[], ISO dow 1=Pzt … 7=Paz
   warmup_enabled: boolean | null;   // true → campaign_warmup_state cap ramp + auto-pause uygulanır
   // Faz 1 — gönderim gerçekçiliği + throttling (0006)
+  priority: number | null;               // worker isleme sirasi; kucuk once (varsayilan 100)
   min_gap_seconds: number | null;        // G3 insansı gönderim aralığı (min)
   random_gap_seconds: number | null;     // G3 rastgele ek süre (jitter)
   max_new_leads_per_day: number | null;  // G4 günlük yeni lead (initial) limiti — null=limitsiz
@@ -664,14 +665,17 @@ async function tick(): Promise<void> {
   running = true;
   try {
     const campaignRows: CampaignRow[] = await sql`
-      SELECT id, template_id, sender_email, sender_pool, daily_cap, segment_filter, created_by,
+      SELECT id, template_id, sender_email, sender_pool, daily_cap, segment_filter, created_by, priority,
              follow_up_steps, ab_test_enabled, ab_winner_variant, ab_winning_metric,
              send_window_start, send_window_end, send_days, warmup_enabled,
              min_gap_seconds, random_gap_seconds, max_new_leads_per_day, prioritize_new_leads,
              send_text_only, first_email_text_only, max_per_company_per_day, stop_company_on_reply
       FROM campaigns
       WHERE status = 'running' AND channel = 'email' AND cron_paused = false
-      ORDER BY started_at NULLS LAST, created_at
+      -- Kampanyalar SIRAYLA islenir ve gonderim arasi 15-22 dk oldugu icin ilk
+      -- siradaki kampanya gunun kapasitesinin cogunu yer. Sira artik acikca
+      -- priority ile kurulur (kucuk once); started_at yalnizca esitlik bozucu.
+      ORDER BY priority ASC, started_at NULLS LAST, created_at
     `;
     if (campaignRows.length === 0) {
       return;

@@ -204,11 +204,35 @@ function renderTemplate(text: string, vars: Record<string, string>): string {
   return resolveSpintax(substituted);
 }
 
-function buildWhatsAppUrl(phone: string | null | undefined): string {
+/**
+ * Kampanya + lead'i tanimlayan kisa takip kodu: "CF29-A1B2".
+ * WhatsApp ile gelen cevaplar CRM'de gorunmuyor (e-posta degil). Bu kod
+ * on-dolgulu mesaja gomulur, boylece gelen her WhatsApp mesaji hangi
+ * kampanyadan/hangi firmadan geldigini kendisi soyler.
+ * Cozmek icin: scripts/whatsapp-kod-coz.mjs <kod>
+ */
+function buildTrackCode(
+  campaignId?: string | null,
+  leadId?: string | null,
+  variant?: string | null,
+): string {
+  const k = (campaignId ?? '').replace(/-/g, '').slice(0, 4).toUpperCase();
+  const l = (leadId ?? '').replace(/-/g, '').slice(0, 6).toUpperCase();
+  if (k.length < 4 || l.length < 6) return '';
+  // A/B varyanti da koda girer: acilma/tiklama takibimiz yok, dolayisiyla
+  // hangi konu basliginin karsilik getirdigini SADECE gelen WhatsApp mesajindan
+  // ogrenebiliyoruz. Varyant kodda olmazsa test olculemez.
+  const v = (variant === 'a' || variant === 'b') ? `-${variant.toUpperCase()}` : '';
+  return `${k}-${l}${v}`;
+}
+
+function buildWhatsAppUrl(phone: string | null | undefined, trackCode?: string): string {
   if (!phone) return '';
   const digits = phone.replace(/[^0-9]/g, '');
   if (digits.length < 8) return '';
-  return `https://wa.me/${digits}`;
+  if (!trackCode) return `https://wa.me/${digits}`;
+  const text = `Merhaba, acente panelini gormek istiyorum. [${trackCode}]`;
+  return `https://wa.me/${digits}?text=${encodeURIComponent(text)}`;
 }
 
 interface ProviderSendResult {
@@ -418,7 +442,7 @@ export async function sendEmailCore(
             rep_full_name: senderName,
             rep_phone: repPhone,
             rep_calendly: repCalendly,
-            rep_whatsapp_url: buildWhatsAppUrl(repPhone),
+            rep_whatsapp_url: buildWhatsAppUrl(repPhone, buildTrackCode(input.campaign_id, lead.id, input.variant)),
             agency_panel_url: agencyPanelUrl,
           };
 
