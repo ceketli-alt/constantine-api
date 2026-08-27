@@ -8,8 +8,9 @@
  *  2. Her state için:
  *     a. sent_today = 0 reset
  *     b. bounce/complaint son 24h sayım
- *     c. bounce > 5% → pause 24h
- *     d. complaint > 0.1% → pause 72h
+ *     c. bounce: >=20 gönderimde oran >%5 → pause 24h; <20 gönderimde mutlak >=3 bounce → pause 24h
+ *        (asgari hacim tabanı: 5 örnekten oran hesaplanmaz — Mert kararı 26 Ağu 2026)
+ *     d. complaint > 0.1% → pause 72h (bilerek gevşetilmedi)
  *     e. paused_until geçtiyse → resume
  *     f. Paused değilse + 24h geçtiyse → warmup_day++, current_cap update
  *     g. activity_events log
@@ -17,8 +18,8 @@
 import type { Context } from 'hono';
 import { sql } from './db.js';
 
-const BOUNCE_RATE_THRESHOLD = 0.05;
-const COMPLAINT_RATE_THRESHOLD = 0.001;
+// Duraklatma karari saf fonksiyonda (test edilebilsin diye): src/warmup-guard.ts
+import { duraklatmaKarari } from './warmup-guard.js';
 
 export function capForDay(day: number): number {
   // COLD B2B OUTREACH ramp (yeni domain). Per-campaign GÜNLÜK tavan.
@@ -91,6 +92,8 @@ export async function runWarmupTick(): Promise<WarmupTickResult> {
       `;
       const bounceCount: number = bounceRows[0]?.n ?? 0;
       const complaintCount: number = complaintRows[0]?.n ?? 0;
+      const karar = duraklatmaKarari(sentLast24h, bounceCount, complaintCount);
+      // loglama icin oranlar (karar artik saf fonksiyonda veriliyor)
       const bounceRate = sentLast24h > 0 ? bounceCount / sentLast24h : 0;
       const complaintRate = sentLast24h > 0 ? complaintCount / sentLast24h : 0;
 
@@ -100,13 +103,9 @@ export async function runWarmupTick(): Promise<WarmupTickResult> {
       let isPausing = false;
       let isResuming = false;
 
-      if (bounceRate > BOUNCE_RATE_THRESHOLD) {
-        newPausedReason = 'bounce_threshold';
-        newPausedUntil = new Date(now.getTime() + 24 * 60 * 60 * 1000);
-        isPausing = !wasPaused;
-      } else if (complaintRate > COMPLAINT_RATE_THRESHOLD) {
-        newPausedReason = 'complaint_threshold';
-        newPausedUntil = new Date(now.getTime() + 72 * 60 * 60 * 1000);
+      if (karar.durdur) {
+        newPausedReason = karar.sebep;
+        newPausedUntil = new Date(now.getTime() + karar.saat * 60 * 60 * 1000);
         isPausing = !wasPaused;
       } else if (wasPaused && newPausedUntil && newPausedUntil <= now) {
         newPausedReason = null;

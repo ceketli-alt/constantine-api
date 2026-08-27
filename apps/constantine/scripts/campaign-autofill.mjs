@@ -5,8 +5,12 @@
  * Her kampanya için: queued < LOW_WATER ise havuzdan yeni lead enroll eder,
  * NeverBounce ile doğrular, çürükleri düşürür + suppress eder.
  *
- * Cron: /etc/cron.d/constantine-mert-reminders → hafta içi 06:15 UTC (09:15 TR),
- * yani gönderim penceresi (09:30 TR) açılmadan hemen önce.
+ * Cron: /etc/cron.d/constantine-mert-reminders → hafta içi 06:15 TR (03:15 UTC;
+ * cron TR yerel saatiyle çalışıyor), yani gönderim penceresi (09:30 TR) açılmadan önce.
+ *
+ * EŞİK NOTU: kuyruk günün gönderimlerinden ÖNCE ölçülüyor. Bu yüzden lowWater
+ * günlük tavanın en az 2-3 katı olmalı; yoksa sabah 'eşiğin üstünde' görünen kuyruk
+ * gün içinde erir ve ertesi sabaha kadar dolum tetiklenmez (26 Ağu: İstanbul 27→17).
  *
  * Log: /root/monitor/campaign-autofill.log
  * Havuz tükenirse: uyarı maili (mert-reminder.sh pool-empty) + sessizce çıkar.
@@ -49,11 +53,14 @@ const CAMPAIGNS = [
   {
     id: 'cf291a24-25e5-4b68-98a4-6a621f425513',
     label: 'IST-ACENTE (site kazısı)',
-    lowWater: 25,
+    lowWater: 75,   // günlük tavan 25 → 3 katı (yukarıdaki EŞİK NOTU; Mert 26 Ağu 15→25 çıkardı)
     batch: 200,
     // Bu havuzda 'email-valid' etiketi YOK — adresler siteden kazındı,
     // doğrulamayı bu scriptin kendi NeverBounce adımı yapıyor.
-    poolFilter: sql`'ist-yeni' = ANY(l.tags)`,
+    // 'ist-kurtarma-2026-08': 26 Ağustos kurtarma turu — mailleri yanlış firmaya
+    // bağlanmış İstanbul acenteleri, kendi sitelerinden gerçek adres kazınarak
+    // düzeltildi (155 düzeltme + 97 teyit + 57 orijinali doğrulanan).
+    poolFilter: sql`('ist-yeni' = ANY(l.tags) OR 'ist-kurtarma-2026-08' = ANY(l.tags))`,
   },
 ];
 
@@ -94,8 +101,10 @@ for (const c of CAMPAIGNS) {
       AND ${c.poolFilter}
       AND NOT EXISTS (SELECT 1 FROM unsubscribes u
         WHERE u.channel='email' AND lower(u.identifier)=lower(l.primary_contact_email))
-      AND NOT EXISTS (SELECT 1 FROM campaign_targets ct
-        WHERE ct.campaign_id=${c.id} AND ct.lead_id=l.id)
+      -- Ayni lead IKI kampanyaya birden girmemeli: eskiden yalnizca AYNI kampanya
+      -- kontrol ediliyordu, bu yuzden bir lead hem Istanbul'a hem 1B'ye dusebiliyordu
+      -- (26 Agu, 1B yeniden acilirken fark edildi).
+      AND NOT EXISTS (SELECT 1 FROM campaign_targets ct WHERE ct.lead_id=l.id)
     ORDER BY (CASE WHEN 'trust-high'=ANY(l.tags) THEN 0
                    WHEN 'trust-medium'=ANY(l.tags) THEN 1 ELSE 2 END),
              l.created_at DESC

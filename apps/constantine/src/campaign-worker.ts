@@ -41,6 +41,14 @@ const FREEMAIL = new Set<string>([
   'icloud.com', 'me.com', 'mac.com', 'aol.com',
   'gmx.com', 'gmx.net', 'mail.com', 'yandex.com', 'yandex.com.tr', 'yandex.ru',
   'proton.me', 'protonmail.com',
+  // TR internet saglayicisi / portal posta kutulari — KOBI'lerde is adresi olarak yaygin.
+  // Bunlar da SIRKET DEGIL: 12 ayri acente superonline.com kullaniyor (2026-08-26 sayimi),
+  // listede olmadiklari icin per-company limiti onlari tek sirket sanip gunde 1'e kisiyordu.
+  // NOT: DB'deki free_email_domains tablosuna EKLENMEDILER — o tablo kurumsal kampanyadan
+  // DISLAMAK icin kullaniliyor, eklenirlerse bu 12 gercek acente hedeflenemez hale gelir.
+  'superonline.com', 'superonline.com.tr', 'ttmail.com', 'turk.net', 'e-kolay.net',
+  'mynet.com', 'dol.com.tr', 'avm.com.tr', 'doruk.net.tr', 'tnn.net',
+  'mail.ru', 'hotmail.de', 'web.de', 'qq.com', 'naver.com',
 ]);
 
 let tickHandle: NodeJS.Timeout | null = null;
