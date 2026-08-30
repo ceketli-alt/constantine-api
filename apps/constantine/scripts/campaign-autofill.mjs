@@ -131,23 +131,37 @@ for (const c of CAMPAIGNS) {
 
   if (NB_KEY && inserted.length) {
     const fresh = await sql`
-      SELECT ct.id, lower(l.primary_contact_email) AS email
+      SELECT ct.id, ct.lead_id, lower(l.primary_contact_email) AS email
       FROM campaign_targets ct JOIN leads l ON l.id=ct.lead_id
       WHERE ct.campaign_id=${c.id} AND ct.status='queued'
         AND ct.lead_id = ANY(${inserted.map(r => r.lead_id)}::uuid[])`;
     const verdicts = await neverbounce([...new Set(fresh.map(r => r.email))]);
-    let dropped = 0;
+    // 29 Ağu (Mert onaylı): 'unknown' da düşürülür. Gerekçe — İstanbul kampanyasının
+    // haftalık bounce oranı %10,6 çıktı ve kuyruğun taranmasında 170 adresin 64'ü
+    // 'unknown' geldi. 'unknown' = NeverBounce kutuyu DOĞRULAYAMADI demek; eskiden
+    // olduğu gibi geçiyordu ve bounce'ların kaynağı buydu. 'catchall' geçmeye devam
+    // eder (sunucu her adresi kabul ettiği için göndermeden çözülemez).
+    // Politika tek kaynakta: lib/nb.mjs → RISKLI
+    let dropped = 0, dogrulanamadi = 0;
     for (const r of fresh) {
       const v = verdicts[r.email];
       if (v === 'invalid' || v === 'disposable') {
         await sql`UPDATE campaign_targets SET status='failed', error=${'neverbounce:' + v} WHERE id=${r.id}`;
+        // kesin çürük → bastırma listesine de gir, bir daha hiç denenmesin
         await sql`INSERT INTO unsubscribes (channel, identifier, reason, source)
           SELECT 'email', ${r.email}, ${'neverbounce_' + v}, 'neverbounce'
           WHERE NOT EXISTS (SELECT 1 FROM unsubscribes WHERE channel='email' AND lower(identifier)=${r.email})`;
         dropped++;
+      } else if (v === 'unknown') {
+        // DOĞRULANAMADI ≠ ÇÜRÜK: kuyruktan düşer ama bastırma listesine GİRMEZ,
+        // çünkü adres pekâlâ geçerli olabilir; ileride başka kanalla değerlendirilebilir.
+        await sql`UPDATE campaign_targets SET status='failed', error='neverbounce:unknown' WHERE id=${r.id}`;
+        await sql`UPDATE leads SET tags = CASE WHEN 'nb-dogrulanamadi' = ANY(tags) THEN tags
+          ELSE array_append(tags,'nb-dogrulanamadi') END WHERE id=${r.lead_id}::uuid`;
+        dogrulanamadi++;
       }
     }
-    log(`${c.label}: NeverBounce → ${dropped} çürük düşürüldü`);
+    log(`${c.label}: NeverBounce → ${dropped} çürük düşürüldü, ${dogrulanamadi} doğrulanamadı`);
   }
 
   if (status === 'completed') {

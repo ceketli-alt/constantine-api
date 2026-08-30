@@ -1,5 +1,12 @@
 #!/usr/bin/env node
 /**
+ * ⚠️ NEVERBOUNCE KAPISI: bu script campaign_targets'a dogrudan INSERT ediyor ve
+ * adres dogrulamasi YAPMIYOR. 29 Agu dersi — autofill dogruluyordu, elle enroll eden
+ * scriptler atliyordu; `tavbilet@tav.aero` o bosluktan gecip bounce etti.
+ * Yeniden kullanilacaksa `lib/nb.mjs`'teki `nbDogrula()` eklenmeli, ya da enroll'dan
+ * sonra `node kuyruk-nb-tara.mjs <campaign_id> --uygula` kosulmali.
+ */
+/**
  * ARAFTAKI LEADLER — Istanbul kazisindan gelen gercek adresler ama bedava-mail.
  * Istanbul kampanyasi kurumsal-only diye reddediyor, Canary de kuyrugu esigin
  * ustunde oldugu icin hic cekmiyor → kimse almiyordu.

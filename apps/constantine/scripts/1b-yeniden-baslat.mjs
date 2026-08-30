@@ -6,6 +6,7 @@
  * node 1b-yeniden-baslat.mjs [--uygula] [adet]
  */
 import postgres from 'postgres'; import fs from 'node:fs';
+import { nbDogrula, RISKLI } from './lib/nb.mjs';
 const KAMPANYA='3c0e9cad-ea5f-4ff3-8df8-54365f113e4a';
 const ETIKET='ist-kurtarma-2026-08';
 const UYGULA=process.argv.includes('--uygula');
@@ -34,9 +35,19 @@ const uygun = Array.isArray(result?.eligible) ? result.eligible : [];
 console.log(`\ntriaj sonrasi uygun: ${uygun.length}`);
 if (result?.rejected?.length) console.log(`  reddedilen: ${result.rejected.length}`);
 
+// NEVERBOUNCE KAPISI — 29 Agu: bu script eskiden bu adimi ATLIYORDU (autofill yapiyordu,
+// elle enroll eden scriptler yapmiyordu) ve tavbilet@tav.aero o bosluktan gecip bounce etti.
+const uygunLeadler = aday.filter(a => uygun.includes(a.id));
+const { riskli, sayim } = await nbDogrula(uygunLeadler.map(a => a.mail), env.NEVERBOUNCE_API_KEY,
+  { ilerleme: (i, n, r) => console.log(`  NB ${i}/${n} · riskli ${r}`) });
+console.log('NeverBounce:', sayim);
+const riskliSet = new Set(riskli);
+const temiz = uygunLeadler.filter(a => !riskliSet.has((a.mail || '').toLowerCase()));
+if (riskli.length) console.log(`  ${riskli.length} adres elendi (${[...RISKLI].join('/')}): ${riskli.slice(0,5).join(', ')}${riskli.length>5?' …':''}`);
+
 const eklendi = await sql`
   INSERT INTO campaign_targets (campaign_id, lead_id, status, sequence_step)
-  SELECT ${KAMPANYA}::uuid, x::uuid, 'queued', 0 FROM unnest(${uygun}::uuid[]) x
+  SELECT ${KAMPANYA}::uuid, x::uuid, 'queued', 0 FROM unnest(${temiz.map(a=>a.id)}::uuid[]) x
   ON CONFLICT (campaign_id, lead_id) DO NOTHING RETURNING lead_id`;
 console.log(`enroll: ${eklendi.length}`);
 
