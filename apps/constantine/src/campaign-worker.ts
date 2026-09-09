@@ -41,6 +41,14 @@ const FREEMAIL = new Set<string>([
   'icloud.com', 'me.com', 'mac.com', 'aol.com',
   'gmx.com', 'gmx.net', 'mail.com', 'yandex.com', 'yandex.com.tr', 'yandex.ru',
   'proton.me', 'protonmail.com',
+  // TR internet saglayicisi / portal posta kutulari — KOBI'lerde is adresi olarak yaygin.
+  // Bunlar da SIRKET DEGIL: 12 ayri acente superonline.com kullaniyor (2026-08-26 sayimi),
+  // listede olmadiklari icin per-company limiti onlari tek sirket sanip gunde 1'e kisiyordu.
+  // NOT: DB'deki free_email_domains tablosuna EKLENMEDILER — o tablo kurumsal kampanyadan
+  // DISLAMAK icin kullaniliyor, eklenirlerse bu 12 gercek acente hedeflenemez hale gelir.
+  'superonline.com', 'superonline.com.tr', 'ttmail.com', 'turk.net', 'e-kolay.net',
+  'mynet.com', 'dol.com.tr', 'avm.com.tr', 'doruk.net.tr', 'tnn.net',
+  'mail.ru', 'hotmail.de', 'web.de', 'qq.com', 'naver.com',
 ]);
 
 let tickHandle: NodeJS.Timeout | null = null;
@@ -132,6 +140,7 @@ interface CampaignRow {
   send_days: number[] | null;       // integer[], ISO dow 1=Pzt … 7=Paz
   warmup_enabled: boolean | null;   // true → campaign_warmup_state cap ramp + auto-pause uygulanır
   // Faz 1 — gönderim gerçekçiliği + throttling (0006)
+  priority: number | null;               // worker isleme sirasi; kucuk once (varsayilan 100)
   min_gap_seconds: number | null;        // G3 insansı gönderim aralığı (min)
   random_gap_seconds: number | null;     // G3 rastgele ek süre (jitter)
   max_new_leads_per_day: number | null;  // G4 günlük yeni lead (initial) limiti — null=limitsiz
@@ -305,6 +314,13 @@ async function processFollowUps(
 
   for (const t of due) {
     if (budget <= 0) break;
+    // Pencere kapandıysa batch'in ORTASINDA da dur. (Gap 15-22 dk olduğu için 10'luk bir
+    // batch ~3 saat sürüyordu; 16:50'de başlayan batch 19:55'e kadar mail atıyordu —
+    // pencere yalnız processCampaign girişinde bakılıyordu. Kalanlar sonraki güne kalır.)
+    if (!isWithinSendWindow(new Date(), campaign.send_window_start, campaign.send_window_end, campaign.send_days, SEND_TZ)) {
+      console.log(`[worker] campaign ${campaign.id}: gonderim penceresi kapandi, batch durduruldu`);
+      break;
+    }
     const nextStep = (t.sequence_step ?? 0) + 1; // gönderilecek takip (1-based)
     const stepCfg = steps[nextStep - 1];          // steps array 0-based
     if (!stepCfg || !stepCfg.template_id) {
@@ -407,6 +423,13 @@ async function processInitials(
 
   let sentCount = 0;
   for (const target of queuedRows) {
+    // Pencere kapandıysa batch'in ORTASINDA da dur. (Gap 15-22 dk olduğu için 10'luk bir
+    // batch ~3 saat sürüyordu; 16:50'de başlayan batch 19:55'e kadar mail atıyordu —
+    // pencere yalnız processCampaign girişinde bakılıyordu. Kalanlar sonraki güne kalır.)
+    if (!isWithinSendWindow(new Date(), campaign.send_window_start, campaign.send_window_end, campaign.send_days, SEND_TZ)) {
+      console.log(`[worker] campaign ${campaign.id}: gonderim penceresi kapandi, batch durduruldu`);
+      break;
+    }
     let overrideTo: string | undefined;
     if (targetRole) {
       const sm = (target.source_meta ?? {}) as Record<string, unknown>;
@@ -650,14 +673,17 @@ async function tick(): Promise<void> {
   running = true;
   try {
     const campaignRows: CampaignRow[] = await sql`
-      SELECT id, template_id, sender_email, sender_pool, daily_cap, segment_filter, created_by,
+      SELECT id, template_id, sender_email, sender_pool, daily_cap, segment_filter, created_by, priority,
              follow_up_steps, ab_test_enabled, ab_winner_variant, ab_winning_metric,
              send_window_start, send_window_end, send_days, warmup_enabled,
              min_gap_seconds, random_gap_seconds, max_new_leads_per_day, prioritize_new_leads,
              send_text_only, first_email_text_only, max_per_company_per_day, stop_company_on_reply
       FROM campaigns
       WHERE status = 'running' AND channel = 'email' AND cron_paused = false
-      ORDER BY started_at NULLS LAST, created_at
+      -- Kampanyalar SIRAYLA islenir ve gonderim arasi 15-22 dk oldugu icin ilk
+      -- siradaki kampanya gunun kapasitesinin cogunu yer. Sira artik acikca
+      -- priority ile kurulur (kucuk once); started_at yalnizca esitlik bozucu.
+      ORDER BY priority ASC, started_at NULLS LAST, created_at
     `;
     if (campaignRows.length === 0) {
       return;
