@@ -15,6 +15,12 @@ export const sql = postgres(DATABASE_URL, {
     // Supabase davranışı: numeric/decimal/bigint → JS number (frontend matematik için)
     numeric: { to: 1700, from: [1700, 700, 701], serialize: (x: number) => String(x), parse: (x: string) => parseFloat(x) },
     bigint:  { to: 20,   from: [20],             serialize: (x: number) => String(x), parse: (x: string) => parseInt(x, 10) },
+    // DATE (OID 1082) → düz 'YYYY-MM-DD' string, PostgREST ile birebir. postgres-js varsayılanı
+    // DATE'i JS Date'e çeviriyor, REST katmanı da onu '2026-09-15T00:00:00.000Z' diye basıyordu:
+    // tarayıcının <input type="date">'i bunu BOŞ gösteriyor (düzenleme formunda tarih "sıfırlandı"
+    // sanılıyordu), `due_date === today` gibi eşitlikler hiç tutmuyordu. TIMESTAMP(TZ) (1114/1184)
+    // Date kalır → ISO. Saat dilimi hilesi yok: '2026-09-15' hangi makinede okunursa okunsun aynı gün.
+    date:    { to: 1082, from: [1082],            serialize: (x: string) => x,         parse: (x: string) => x },
   },
 });
 

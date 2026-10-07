@@ -37,7 +37,8 @@ const PUBLIC_TABLES_VIEW = new Set([
 /**
  * Date-aware JSON serializer.
  *
- * postgres-js DATE / TIMESTAMP kolonlarını JS Date object olarak döndürür.
+ * postgres-js TIMESTAMP / TIMESTAMPTZ kolonlarını JS Date object olarak döndürür
+ * (DATE kolonları db.ts'teki özel tiple düz 'YYYY-MM-DD' string gelir — PostgREST gibi).
  * JSON.stringify Invalid Date'i `RangeError: Invalid time value` ile fırlatır;
  * tek bir bozuk satır tüm endpoint'i 400'e düşürür. Bu replacer:
  *   - geçerli Date → ISO string

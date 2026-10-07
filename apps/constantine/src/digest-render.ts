@@ -175,7 +175,7 @@ function fmtCurrency(amount: number, currency: string): string {
   return `${n} ${currency}`;
 }
 
-/** Defansif: postgres-js bazen Date object döner; string'e çevir önce. */
+/** Defansif: DATE düz string gelir (db.ts), TIMESTAMP kolonları Date — ikisini de 'YYYY-MM-DD'ye indir. */
 function toIsoStr(iso: string | Date | null | undefined): string {
   if (!iso) return '';
   if (iso instanceof Date) return iso.toISOString().slice(0, 10);

@@ -55,7 +55,7 @@ function todayInIstanbul(): string {
   return tr.toISOString().slice(0, 10);
 }
 
-/** postgres-js DATE/TIMESTAMP kolonlarını JS Date dönüştürür — render her yerde string ISO bekliyor */
+/** DATE düz 'YYYY-MM-DD' string gelir (db.ts özel tip), TIMESTAMP kolonları JS Date — render her yerde string bekliyor */
 function asIso(v: string | Date | null | undefined): string {
   if (!v) return '';
   if (typeof v === 'string') return v.length > 10 ? v.slice(0, 10) : v;

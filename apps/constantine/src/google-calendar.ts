@@ -419,7 +419,8 @@ export async function handleCalendarPush(c: Context): Promise<Response> {
   }
 
   // Build event — bk.date Date objesi de olabilir, ISO timestamp string de.
-  // Postgres `date` -> postgres-js Date; view'lar string ("2026-05-23T00:00:00.000Z") dönebilir.
+  // DATE artık db.ts'teki özel tiple düz 'YYYY-MM-DD' string gelir; instanceof dalı eski/olağan dışı
+  // kaynaklara (JS Date, saatli ISO) karşı defans olarak kaldı.
   // Her iki durumda da yyyy-MM-dd al.
   const datePart = (bk.date instanceof Date)
     ? bk.date.toISOString().slice(0, 10)
