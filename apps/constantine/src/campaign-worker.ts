@@ -132,6 +132,7 @@ interface CampaignRow {
   segment_filter: any;
   created_by: string | null;
   follow_up_steps: FollowUpStep[] | null;
+  follow_up_only_opened: boolean | null; // takibi yalnızca maili AÇANLARA gönder (8 Eki 2026)
   ab_test_enabled: boolean | null;
   ab_winner_variant: string | null;
   ab_winning_metric: string | null;  // 'auto' | 'reply' | 'open' (G — Faz 2 metrik seçimi)
@@ -308,6 +309,18 @@ async function processFollowUps(
       AND status = 'sent'
       AND next_followup_at IS NOT NULL
       AND next_followup_at <= now()
+      -- Yalnızca açanlara (açıksa): ilk maili bir İNSANIN açtığı görülmüş olmalı. Gönderimden
+      -- sonraki 120 sn içindeki açılma Apple Mail / güvenlik tarayıcısı ön yüklemesidir, sayılmaz.
+      -- Açmayan seçilmez ama next_followup_at korunur: sonradan açarsa takibini o zaman alır.
+      AND (${campaign.follow_up_only_opened !== true} OR EXISTS (
+        SELECT 1 FROM email_messages m
+        JOIN email_threads th ON th.id = m.thread_id
+        JOIN email_events e ON e.message_id = m.id AND e.event_type = 'opened'
+        WHERE th.lead_id = campaign_targets.lead_id
+          AND m.campaign_id = ${campaign.id}
+          AND m.direction = 'outbound'
+          AND e.occurred_at > m.sent_at + interval '120 seconds'
+      ))
     ORDER BY next_followup_at
     LIMIT ${budget}
   `;
@@ -674,7 +687,7 @@ async function tick(): Promise<void> {
   try {
     const campaignRows: CampaignRow[] = await sql`
       SELECT id, template_id, sender_email, sender_pool, daily_cap, segment_filter, created_by, priority,
-             follow_up_steps, ab_test_enabled, ab_winner_variant, ab_winning_metric,
+             follow_up_steps, follow_up_only_opened, ab_test_enabled, ab_winner_variant, ab_winning_metric,
              send_window_start, send_window_end, send_days, warmup_enabled,
              min_gap_seconds, random_gap_seconds, max_new_leads_per_day, prioritize_new_leads,
              send_text_only, first_email_text_only, max_per_company_per_day, stop_company_on_reply

@@ -32,6 +32,35 @@ function stripBrackets(s: string | null | undefined): string | null {
   return s.replace(/^[<\s]+|[>\s]+$/g, '').trim() || null;
 }
 
+/** Gelen cevabın leade nasıl bağlandığı. 'email' = birebir adres (eski tek yol). */
+export type LeadMatch = 'email' | 'header' | 'domain';
+
+/** In-Reply-To + References başlıklarından tekil, köşeli parantezsiz mesaj kimlikleri. */
+export function headerRefIds(inReplyTo: string | null, references: string | null | undefined): string[] {
+  const ids = [inReplyTo, ...String(references ?? '').split(/\s+/).map((r) => stripBrackets(r))];
+  return [...new Set(ids.filter((x): x is string => !!x))];
+}
+
+/**
+ * Instantly warmup trafiği mi? Warmup mailleri hesaba özel bir etiket taşır (konuda,
+ * ör. "Re: our list | H3F6MZ7 GCDQP58"). Bunlar eşleşmeyen-gelen listesine yazılmaz,
+ * yoksa liste günde onlarca sahte mesajla dolar ve gerçek cevap içinde kaybolur.
+ */
+const WARMUP_TAGS = (process.env.WARMUP_FILTER_TAGS ?? 'GCDQP58')
+  .split(',').map((t) => t.trim()).filter(Boolean);
+export function isWarmupTraffic(subject: string | null | undefined): boolean {
+  const s = String(subject ?? '');
+  return WARMUP_TAGS.some((t) => s.includes(t));
+}
+
+/** Kendi gönderici alan adlarımızdan gelen mail (iç test, kutular arası) — müşteri değil. */
+const OWN_DOMAINS = ['constantineyachts.online', 'constantineboat.online', 'constantineyacht.online',
+  'constantineyachts.com', 'send.constantineyachts.com'];
+export function isOwnAddress(email: string | null | undefined): boolean {
+  const d = String(email ?? '').toLowerCase().split('@')[1] ?? '';
+  return OWN_DOMAINS.includes(d);
+}
+
 /**
  * Auto-reply / OOO algılama. Amaç: otomatik yanıtlar (out-of-office, vacation responder, robot)
  * cold-outreach sequence'ini DURDURMASIN ve reply-rate'i (A/B winner) ŞİŞİRMESİN.
@@ -182,11 +211,71 @@ export async function processInboundEmail(input: InboundEmailInput): Promise<Inb
                created_at ASC
       LIMIT 1
     `;
-    const lead = leadRows[0];
+    let lead = leadRows[0];
+    let leadMatchedBy: LeadMatch = 'email';
+
+    // 1b. Başlık eşleşmesi — cevap BİZİM attığımız bir maile mi? (8 Eki 2026)
+    //     info@acente.com'a yazdık, ahmet@acente.com cevap verdi: adres tutmaz ama
+    //     In-Reply-To/References bizim mesajımızı gösterir. Eskiden lead adresten
+    //     bulunamayınca cevap burada ATILIYORDU, thread eşleşmesine hiç sıra gelmiyordu.
+    if (!lead) {
+      const refIds = headerRefIds(inReplyTo, referencesHeader);
+      if (refIds.length > 0) {
+        const rows = await sql`
+          SELECT l.id, l.company_name, l.email_thread_id
+          FROM email_messages m
+          JOIN email_threads t ON t.id = m.thread_id
+          JOIN leads l ON l.id = t.lead_id
+          WHERE m.message_id_header = ANY(${refIds as any}) AND m.direction = 'outbound'
+          LIMIT 1
+        `;
+        if (rows[0]) { lead = rows[0]; leadMatchedBy = 'header'; }
+      }
+    }
+
+    // 1c. Alan adı eşleşmesi — başlıksız yeni mail (cevapla demeden yazan biri).
+    //     Yalnızca kurumsal alan adı VE o alan adında TEK bir temas edilmiş lead varsa:
+    //     birden çok lead varsa (zincir otel vb.) yanlış leadi "cevap verdi" diye işaretleyip
+    //     onun sırasını durdurmaktansa eşleşmeyen listesine düşürmek daha güvenli.
+    if (!lead) {
+      const fromDomain = fromEmail.split('@')[1] ?? '';
+      if (fromDomain) {
+        const rows = await sql`
+          SELECT l.id, l.company_name, l.email_thread_id
+          FROM leads l
+          WHERE lower(split_part(l.primary_contact_email, '@', 2)) = ${fromDomain}
+            AND l.last_contacted_at IS NOT NULL
+            AND NOT EXISTS (SELECT 1 FROM free_email_domains f WHERE lower(f.domain) = ${fromDomain})
+          ORDER BY l.last_contacted_at DESC
+          LIMIT 2
+        `;
+        if (rows.length === 1) { lead = rows[0]; leadMatchedBy = 'domain'; }
+      }
+    }
+
     if (!lead) {
       console.log(`[email-inbound] no lead match for ${fromEmail} (source=${input.source ?? '?'})`);
+      // Eşleşmeyen gelen kaybolmasın: warmup trafiği DIŞINDAKİLERİ kayda al,
+      // günlük özet "eşleşmeyen gelen: N" diye gösterir.
+      if (!isWarmupTraffic(subject) && !isOwnAddress(fromEmail)) {
+        await sql`
+          INSERT INTO inbound_unmatched
+            (received_at, from_email, from_name, to_email, subject, body_snippet,
+             message_id_header, in_reply_to, source)
+          VALUES (${receivedIso}, ${fromEmail}, ${fromName}, ${toEmail}, ${subject},
+                  ${String(input.body_text ?? '').slice(0, 500)},
+                  ${messageIdHeader}, ${inReplyTo}, ${input.source ?? null})
+          ON CONFLICT (message_id_header) WHERE message_id_header IS NOT NULL DO NOTHING
+        `.catch((e: any) => console.warn('[email-inbound] inbound_unmatched yazılamadı:', e?.message));
+      }
       return { ok: true, tracked: false, reason: 'no_lead_match' };
     }
+
+    // Lead adresten değil başlık/alan adından bulunduysa iz bırak: CRM'de "cevap
+    // info@ yerine ahmet@'ten geldi" görülebilsin.
+    const rawPayloadWithMatch = leadMatchedBy === 'email'
+      ? rawJson
+      : sql.json({ ...((input.raw_payload as any) ?? {}), lead_match: leadMatchedBy, lead_match_from: fromEmail } as any);
 
     // 2. Thread matching
     let threadId: string | null = null;
@@ -293,7 +382,7 @@ export async function processInboundEmail(input: InboundEmailInput): Promise<Inb
       ) VALUES (
         ${threadId}, 'inbound', ${fromEmail}, ${fromName}, ${toEmail}, ${subject},
         ${input.body_html ?? null}, ${input.body_text ?? null}, ${messageIdHeader}, ${inReplyTo},
-        ${receivedIso}, ${receivedIso}, ${rawJson}
+        ${receivedIso}, ${receivedIso}, ${rawPayloadWithMatch}
       )
       RETURNING id
     `;
@@ -314,7 +403,7 @@ export async function processInboundEmail(input: InboundEmailInput): Promise<Inb
       try {
         await sql`
           INSERT INTO email_events (message_id, event_type, occurred_at, raw_payload)
-          VALUES (${messageId}, 'replied', ${receivedIso}, ${rawJson})
+          VALUES (${messageId}, 'replied', ${receivedIso}, ${rawPayloadWithMatch})
         `;
       } catch (e: any) {
         console.warn('[email-inbound] email_events insert skipped:', e.message);
