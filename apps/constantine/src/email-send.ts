@@ -306,7 +306,7 @@ export async function sendEmailCore(
         // ─── 1. Lead fetch ───────────────────────────────────────────
         const leadRows = await tx`
           SELECT id, primary_contact_email, primary_contact_name, company_name,
-                 status, source_meta, custom_fields, email_thread_id
+                 status, source_meta, custom_fields, email_thread_id, tags
           FROM leads
           WHERE id = ${input.lead_id}
         `;
@@ -543,7 +543,11 @@ export async function sendEmailCore(
           replyTo,
           subject,
           // text-only ise HTML part'ı gönderme (deliverability). DB'de body_html yine saklanır (kayıt).
-          ...(input.text_only ? {} : { html: finalHtml }),
+          // 'duz-metin' etiketli lead HER ZAMAN düz metin alır (15 Eki 2026): Yandex, 8 Eki'de
+          // HTML'e (açılma pikseli) geçince içeriği reddetmeye başladı (Transient/ContentRejected,
+          // 4/4 Yandex; öncesinde hiç yoktu). Düz metin Yandex'ten geçiyordu. Etiketi
+          // scripts/duz-metin-etiketle.mjs MX'e bakarak koyar.
+          ...((input.text_only || (Array.isArray(lead.tags) && lead.tags.includes('duz-metin'))) ? {} : { html: finalHtml }),
           text: finalText,
           tags: [
             { name: 'lead_id', value: lead.id },

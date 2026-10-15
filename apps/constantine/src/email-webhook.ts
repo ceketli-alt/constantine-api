@@ -165,7 +165,14 @@ export async function handleResendWebhook(c: Context): Promise<Response> {
     // send-time'da unsubscribes'i exact-match kontrol eder (channel IN ('email','all')),
     // o yüzden lead'in STORED email'ini identifier yapıyoruz ki ileride tutsun.
     // NOT: 'delivery_delayed' (geçici/soft) suppress EDİLMEZ — sadece kalıcı bounce + complaint.
-    if ((eventType === 'bounced' || eventType === 'complained') && recipientEmail) {
+    // 15 Eki 2026: YALNIZCA KALICI bounce bastırır. Eskiden her 'bounced' olayı (Transient
+    // dahil) adresi kalıcı olarak bastırıp leadi opt-out yapıyordu. 12-14 Eki'de Yandex
+    // içeriği reddetti (Transient/ContentRejected) — adresler sağlamdı, ama 4 acente kalıcı
+    // olarak listeden silindi. Geçici red (içerik, kutu dolu, genel) adresin kötü olduğunu
+    // göstermez; olay kaydedilir, bounce oranına sayılır, ama bastırma YAPILMAZ.
+    const bounceType: string = String(body?.data?.bounce?.type ?? '');
+    const kaliciBounce = eventType === 'bounced' && bounceType !== 'Transient';
+    if ((kaliciBounce || eventType === 'complained') && recipientEmail) {
       const reason = eventType === 'complained' ? 'spam_complaint' : 'hard_bounce';
       try {
         const leadRows = await sql`
