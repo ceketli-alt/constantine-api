@@ -7,11 +7,16 @@
  * 26 Agu'da tam bu yuzden durdu. Bes ornekten oran hesaplanmaz.
  * Artik: hacim tabanin altindaysa MUTLAK sayiya bakilir, ustundeyse orana.
  *
- * Sikayet (complaint) kurali BILEREK gevsetilmedi: spam sikayeti nadir ve agir bir
- * sinyaldir, tek sikayet bile 72 saat durdurur.
+ * Sikayet (complaint) kurali — Mert karari 21 Eki 2026: tek sikayet artik DURDURMAZ.
+ * Eskiden oran > %0,1 idi; gunde 100 gonderimde tek sikayet %1 demek → kampanya 72 saat
+ * duruyordu. Soguk mailde tek tuk "spam" tiklamasi gurultudur. Yeni kural: 24 saatte EN AZ 2
+ * sikayet VE oran > %0,3 (Google'in toplu gonderici sert siniri). Gunde 100'de 2 sikayet = %2 →
+ * durur; gunde 1.000'de 2 sikayet = %0,2 → durmaz, 4 gerekir. Durdurma suresi 24 saat (Mert 21 Eki: 3 gun degil 1 gun).
  */
 export const BOUNCE_RATE_THRESHOLD = 0.05;
-export const COMPLAINT_RATE_THRESHOLD = 0.001;
+export const COMPLAINT_RATE_THRESHOLD = 0.003;
+/** Durdurma icin gereken asgari sikayet sayisi — tek sikayet gurultu sayilir. */
+export const MIN_SIKAYET = 2;
 
 /** Oran kuralinin anlamli olmasi icin gereken asgari gonderim sayisi. */
 export const MIN_ORAN_HACMI = 20;
@@ -41,9 +46,9 @@ export function duraklatmaKarari(
       aciklama: `dusuk hacimde ${bounceCount} bounce (${gonderim} gonderim)` };
   }
 
-  const sikayetOrani = gonderim > 0 ? complaintCount / gonderim : 0;
-  if (sikayetOrani > COMPLAINT_RATE_THRESHOLD) {
-    return { durdur: true, sebep: 'complaint_threshold', saat: 72,
+  const sikayetOrani = gonderim > 0 ? complaintCount / gonderim : (complaintCount > 0 ? 1 : 0);
+  if (complaintCount >= MIN_SIKAYET && sikayetOrani > COMPLAINT_RATE_THRESHOLD) {
+    return { durdur: true, sebep: 'complaint_threshold', saat: 24,
       aciklama: `sikayet ${complaintCount}/${gonderim}` };
   }
 

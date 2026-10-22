@@ -22,7 +22,7 @@ import { sql } from './db.js';
 import { sendEmailCore } from './email-send.js';
 import { computeAbWinner, type AbVariantStat } from './ab-winner.js';
 import { isWithinSendWindow } from './send-window.js';
-import { capForDay } from './cron-warmup-tick.js';
+import { capForDay, mailboxCount } from './cron-warmup-tick.js';
 
 const TICK_INTERVAL_MS = Number(process.env.CAMPAIGN_WORKER_TICK_MS ?? 60_000);
 const BATCH_SIZE = Number(process.env.CAMPAIGN_WORKER_BATCH_SIZE ?? 10);
@@ -276,9 +276,9 @@ const DAY_MS = 86_400_000;
 async function fetchOriginalSend(
   campaignId: string,
   leadId: string,
-): Promise<{ subject: string | null; to_email: string | null }> {
+): Promise<{ subject: string | null; to_email: string | null; message_id_header: string | null; from_email: string | null }> {
   const rows = await sql`
-    SELECT em.subject, em.to_email
+    SELECT em.subject, em.to_email, em.message_id_header, em.from_email
     FROM email_messages em
     JOIN email_threads et ON et.id = em.thread_id
     WHERE em.campaign_id = ${campaignId}
@@ -287,7 +287,12 @@ async function fetchOriginalSend(
     ORDER BY em.sent_at DESC NULLS LAST
     LIMIT 1
   `;
-  return { subject: rows[0]?.subject ?? null, to_email: rows[0]?.to_email ?? null };
+  return {
+    subject: rows[0]?.subject ?? null,
+    to_email: rows[0]?.to_email ?? null,
+    message_id_header: rows[0]?.message_id_header ?? null,
+    from_email: rows[0]?.from_email ?? null,
+  };
 }
 
 /**
@@ -348,10 +353,17 @@ async function processFollowUps(
       {
         lead_id: t.lead_id,
         template_id: stepCfg.template_id,
-        sender_email: pickSender(campaign, t.lead_id),    // sticky: ilk maille aynı adres
+        // İLK MAİLİ ATAN KUTU (21 Eki 2026): pickSender lead_id hash'ini havuz boyutuna böler;
+        // havuza kutu eklenince/çıkınca dağılım KAYAR ve takip, ilk maili atandan farklı bir
+        // adresten "Re:" olarak giderdi. Gerçek gönderen her zaman önceliklidir.
+        sender_email: orig.from_email ?? pickSender(campaign, t.lead_id),
         campaign_id: campaign.id,
         override_to_email: orig.to_email ?? undefined,   // aynı alıcı
         subject_override: reSubject(orig.subject),        // "Re: <orijinal konu>" → yanıt gibi, aynı thread
+        // Gerçek cevap başlığı (21 Eki 2026): yalnızca "Re:" konusu Outlook'ta aynı konuşmaya
+        // bağlanmıyordu. message_id_header 8 Eki'den beri webhook'tan doluyor (köşeli parantezsiz
+        // saklanır; başlık RFC 5322 gereği <...> ister).
+        in_reply_to: orig.message_id_header ? `<${orig.message_id_header}>` : undefined,
         sequence_step: nextStep,
         variant: normVariant(t.variant),                  // takip de aynı varyant (B template varsa)
         text_only: campaign.send_text_only === true,      // G7 (first_email_text_only sadece step 0 için)
@@ -536,7 +548,7 @@ async function processCampaign(campaign: CampaignRow, fallbackUserId: string | n
   if (warmupEnabled) {
     await sql`
       INSERT INTO campaign_warmup_state (campaign_id, warmup_day, current_cap)
-      VALUES (${campaign.id}, 1, ${capForDay(1)})
+      VALUES (${campaign.id}, 1, ${capForDay(1, mailboxCount(campaign.sender_pool))})
       ON CONFLICT (campaign_id) DO NOTHING
     `;
     const wsRows = await sql`

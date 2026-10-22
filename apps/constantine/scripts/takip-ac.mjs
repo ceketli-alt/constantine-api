@@ -22,7 +22,18 @@ const UYGULA = process.argv.includes('--uygula'), KAPAT = process.argv.includes(
 
 const GOVDE = `Merhaba,
 
-Geçen hafta kış grupları için yazmıştım. Bu sezon İstanbul'a gelen bir grubunuz varsa tarih ve kişi sayısını yazmanız yeterli, aynı gün fiyat iletelim.
+Constantine Yachts olarak bu kışa özel bir teklifimiz var:
+
+Kasım–Mart arası Boğaz turlarında acentelere %25 kış indirimi.
+- Gruplarınıza özel yat
+- Yemekli ya da yemeksiz seçenek
+(Yılbaşı ve özel günler hariçtir.)
+
+Acente fiyatlarımızı buradan görebilirsiniz: https://acente.constantineyachts.com/acente/genel
+
+Google'da 5,0 puanımız ve 800'ü aşkın misafir yorumumuz var.
+
+Bu kış bir grubunuz varsa tarih ve kişi sayısını yazmanız yeterli, aynı gün indirimli fiyatı iletebiliriz. İyi çalışmalar dileriz.
 
 Mert Ödemiş
 Constantine Yachts
@@ -61,7 +72,7 @@ if (!UYGULA) {
 const [mevcut] = await sql`SELECT id FROM email_templates WHERE name=${AD}`;
 const id = mevcut ? mevcut.id : (await sql`
   INSERT INTO email_templates (name, display_name, subject, body_html, body_text, variables, category, is_active)
-  VALUES (${AD}, 'Kış 2026 — Acente takip (yalnız açanlar)', '(ilk mailin konusu kullanılır)', '', ${GOVDE},
+  VALUES (${AD}, 'Kış 2026 — %25 kış indirimi (yalnız açanlar, Mert metni 21 Eki)', '(ilk mailin konusu kullanılır)', '', ${GOVDE},
           '[]'::jsonb, 'outreach', true) RETURNING id`)[0].id;
 if (mevcut) await sql`UPDATE email_templates SET body_text=${GOVDE}, body_html='' WHERE id=${id}`;
 

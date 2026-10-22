@@ -16,7 +16,14 @@ const calistir = promisify(execFile);
 
 const METIN = process.argv.includes('--metin');
 const HTML_BASLANGIC = '2026-10-08T20:20:00Z';            // 1C bu andan sonra HTML gönderiyor
-const IZLENEN_ALAN = 'constantineyachts.online';           // Resend'de açılma takibi açık tek alan
+// Açılma takibinin açık olduğu alan adı → AÇILDIĞI AN. Öncesindeki gönderimler piksel taşımaz,
+// sayılırsa "açılmadı" görünüp oranı düşürür. boat/yacht 21 Eki 2026'da özel takip alt alanı
+// (links.<alan> CNAME) ile açıldı — Resend artık takip için bunu şart koşuyor.
+const IZLENEN = {
+  'constantineyachts.online': '2026-10-08T20:20:00Z',
+  'constantineboat.online':   '2026-10-21T11:20:00Z',
+  'constantineyacht.online':  '2026-10-21T11:35:00Z',
+};
 const MAKINE_SN = 120;
 const NABIZ_SAAT = 6;
 const CACHE = '/root/monitor/mx-saglayici.json';
@@ -56,7 +63,9 @@ const mailler = await sql`
               AND e.occurred_at <= m.sent_at + make_interval(secs => ${MAKINE_SN})) makine
   FROM email_messages m
   WHERE m.direction='outbound' AND m.campaign_id IS NOT NULL
-    AND lower(m.from_email) LIKE ${'%@' + IZLENEN_ALAN} AND m.created_at > ${HTML_BASLANGIC}`;
+    AND m.created_at > ${HTML_BASLANGIC}
+    AND (${sql.unsafe(Object.entries(IZLENEN).map(([a, t]) =>
+      `(lower(m.from_email) LIKE '%@${a}' AND m.created_at > '${t}')`).join(' OR '))})`;
 
 let cache = {};
 try { cache = JSON.parse(fs.readFileSync(CACHE, 'utf8')); } catch {}
@@ -86,7 +95,8 @@ if (toplamTeslim === 0) {
   const sira = ['Google', 'Yandex', 'Kendi sunucusu', 'Microsoft', 'Bilinmiyor'];
   const parcalar = sira.filter(s => grup[s]).map(s => {
     const g = grup[s]; const oran = Math.round(g.insan * 100 / g.teslim);
-    const uyari = s === 'Microsoft' ? ' (resmi engeller, oran yanıltıcı)' : '';
+    const uyari = s === 'Microsoft' ? ' (resmi engeller, oran yanıltıcı)'
+                : s === 'Yandex' ? ' (15 Eki\'den beri düz metin → piksel yok, ölçülemez)' : '';
     return `${s}: ${g.insan}/${g.teslim} = %${oran}${uyari}`;
   });
   const makine = Object.values(grup).reduce((a, g) => a + g.makine, 0);

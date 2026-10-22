@@ -10,7 +10,7 @@
  *     b. bounce/complaint son 24h sayım
  *     c. bounce: >=20 gönderimde oran >%5 → pause 24h; <20 gönderimde mutlak >=3 bounce → pause 24h
  *        (asgari hacim tabanı: 5 örnekten oran hesaplanmaz — Mert kararı 26 Ağu 2026)
- *     d. complaint > 0.1% → pause 72h (bilerek gevşetilmedi)
+ *     d. complaint: 24 saatte >=2 sikayet VE oran >%0,3 → pause 24h (Mert 21 Eki 2026)
  *     e. paused_until geçtiyse → resume
  *     f. Paused değilse + 24h geçtiyse → warmup_day++, current_cap update
  *     g. activity_events log
@@ -21,16 +21,24 @@ import { sql } from './db.js';
 // Duraklatma karari saf fonksiyonda (test edilebilsin diye): src/warmup-guard.ts
 import { duraklatmaKarari } from './warmup-guard.js';
 
-export function capForDay(day: number): number {
-  // COLD B2B OUTREACH ramp (yeni domain). Per-campaign GÜNLÜK tavan.
-  // Bu değerler 2 gönderici mailbox varsayımıyla seçildi → değer ÷ mailbox = mailbox başına/gün.
-  // ESKİ eğri (50/100/200/500/1000) transactional/warmup-pool içindi; cold outreach'te
-  // yeni domaini ilk haftada yakardı. Cold'da güvenli tavan ~25 mail/mailbox/gün.
-  // NOT: 1 mailbox'a düşersen daily_cap'i elle indir (tavan tek mailbox'a yüklenir).
-  if (day <= 3) return 20;   // ~10/mailbox — ilk dokunuş, çok temkinli
-  if (day <= 7) return 30;   // ~15/mailbox
-  if (day <= 14) return 40;  // ~20/mailbox
-  return 50;                 // ~25/mailbox — cold steady-state tavan (üstüne çıkma)
+export function capForDay(day: number, mailboxes = 2): number {
+  // COLD B2B OUTREACH ramp. Güvenli soğuk tavan KUTU BAŞINA ~25/gün; kampanya tavanı = kutu başı
+  // × gönderici kutu sayısı. 21 Eki 2026'ya kadar "2 kutu" varsayımı sabit kodluydu → HER kampanya
+  // 50/gün'de kilitleniyordu; 6 kutulu havuzda da (daily_cap ne olursa olsun) 50'yi geçemiyordu.
+  // mailboxes=2 (varsayılan) eski eğriyle BİREBİR aynı: 20/30/40/50.
+  const n = Math.max(1, Math.floor(mailboxes));
+  let perMailbox: number;
+  if (day <= 3) perMailbox = 10;        // ilk dokunuş, çok temkinli
+  else if (day <= 7) perMailbox = 15;
+  else if (day <= 14) perMailbox = 20;
+  else perMailbox = 25;                 // cold steady-state (kutu başına üstüne çıkma)
+  return perMailbox * n;
+}
+
+/** Kampanyanın gerçek gönderici kutu sayısı: sender_pool doluysa onun boyu, yoksa 1. */
+export function mailboxCount(senderPool: unknown): number {
+  const pool = Array.isArray(senderPool) ? senderPool.filter((s) => typeof s === 'string' && s.includes('@')) : [];
+  return pool.length > 0 ? pool.length : 1;
 }
 
 export interface WarmupTickResult {
@@ -57,7 +65,7 @@ export async function runWarmupTick(): Promise<WarmupTickResult> {
     SELECT ws.id, ws.campaign_id, ws.warmup_day, ws.current_cap, ws.sent_today,
            ws.bounce_count_24h, ws.complaint_count_24h,
            ws.paused_reason, ws.paused_until, ws.last_advanced_at,
-           c.name AS campaign_name
+           c.name AS campaign_name, c.sender_pool
     FROM campaign_warmup_state ws
     INNER JOIN campaigns c ON c.id = ws.campaign_id
     WHERE c.warmup_enabled = true
@@ -125,7 +133,7 @@ export async function runWarmupTick(): Promise<WarmupTickResult> {
 
       if (!willBePaused && dayPassed) {
         newDay = newDay + 1;
-        newCap = capForDay(newDay);
+        newCap = capForDay(newDay, mailboxCount(state.sender_pool));
         lastAdvancedAtIso = now.toISOString();
         advanced = true;
       }
