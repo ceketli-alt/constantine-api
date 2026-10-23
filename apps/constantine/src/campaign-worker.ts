@@ -410,6 +410,9 @@ async function processFollowUps(
  * Phase B — yeni ilk mailler (queued targets). status='sent' olunca trigger
  * (trg_schedule_first_followup) ilk takibi otomatik zamanlar.
  */
+/** Aynı firmaya iki ilk mail arasında en az bu kadar gün (takipler hariç — onların kendi gecikmesi var). */
+const MIN_GUN_ARASI = 7;
+
 async function processInitials(
   campaign: CampaignRow,
   targetRole: string | null,
@@ -427,6 +430,12 @@ async function processInitials(
     WHERE ct.campaign_id = ${campaign.id}
       AND ct.status = 'queued'
       AND (ct.scheduled_at IS NULL OR ct.scheduled_at <= now())
+      -- 22 Eki 2026 (Mert): aynı firmaya 7 günden sık ilk mail gitmez — başka kampanyadan
+      -- yakın zamanda mail aldıysa hedef kuyrukta bekler, süre dolunca kendiliğinden gider.
+      AND NOT EXISTS (
+        SELECT 1 FROM email_messages m JOIN email_threads th ON th.id = m.thread_id
+        WHERE th.lead_id = ct.lead_id AND m.direction = 'outbound'
+          AND m.sent_at > now() - make_interval(days => ${MIN_GUN_ARASI}))
     ORDER BY COALESCE(ct.scheduled_at, ct.created_at)
     LIMIT ${budget}
   `;
