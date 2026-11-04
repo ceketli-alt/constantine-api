@@ -19,6 +19,7 @@
 import type { Context } from 'hono';
 import { sql } from './db.js';
 import { sendDigestViaResend } from './digest-sender.js';
+import { filterDigestRecipients } from './digest-allowlist.js';
 import {
   composeDigestPayload,
   selectDigestRecipients,
@@ -493,7 +494,7 @@ export async function runSalesDailyDigest(): Promise<DigestRunResult> {
     FROM profiles
     WHERE role IN ('super_admin', 'partner')
   `;
-  const recipients = selectDigestRecipients(profiles);
+  const recipients = filterDigestRecipients(selectDigestRecipients(profiles));
   if (recipients.length === 0) {
     return {
       ok: true,

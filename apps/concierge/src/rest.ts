@@ -62,12 +62,12 @@ export async function handleRest(c: Context, method: string, table: string): Pro
       return await withRequestContext(ctx, async (tx) => {
         const params: unknown[] = [];
         const { sqlText } = buildSelectSQL(table, pq, params);
-        const rows = await (tx as any).unsafe(sqlText, params);
+        const rows = await (tx as any).unsafe(sqlText, params, { simple: false });
         let total: number | undefined;
         if (countExact) {
           const cparams: unknown[] = [];
           const { sqlText: countText } = buildCountSQL(table, pq, cparams);
-          const cres = await (tx as any).unsafe(countText, cparams);
+          const cres = await (tx as any).unsafe(countText, cparams, { simple: false });
           total = Number(cres[0]?.count ?? 0);
         }
         const headers: Record<string, string> = {
@@ -96,7 +96,7 @@ export async function handleRest(c: Context, method: string, table: string): Pro
       return await withRequestContext(ctx, async (tx) => {
         const params: unknown[] = [];
         const { sqlText } = buildInsertSQL(table, rows, params, prefer.includes('resolution=ignore-duplicates') ? 'ignore' : undefined);
-        const inserted = await (tx as any).unsafe(sqlText, params);
+        const inserted = await (tx as any).unsafe(sqlText, params, { simple: false });
         // PostgREST: INSERT → 201 Created. Body null değil; representation yoksa boş array konvansiyonu.
         // Not: 201 null-body status değil, '' yerine null da kabul olur ama '[]' supabase-js client
         // .single()/array beklentilerine daha az sürpriz.
@@ -120,7 +120,7 @@ export async function handleRest(c: Context, method: string, table: string): Pro
       return await withRequestContext(ctx, async (tx) => {
         const params: unknown[] = [];
         const { sqlText } = buildPatchSQL(table, pq, body, params);
-        const updated = await (tx as any).unsafe(sqlText, params);
+        const updated = await (tx as any).unsafe(sqlText, params, { simple: false });
         // Fetch spec: 204 No Content MUST have null body. '' bile undici Response constructor'da
         // TypeError atar. representation yoksa null body + 204 dön.
         if (!returnRepresentation) {
@@ -141,7 +141,7 @@ export async function handleRest(c: Context, method: string, table: string): Pro
       return await withRequestContext(ctx, async (tx) => {
         const params: unknown[] = [];
         const { sqlText } = buildDeleteSQL(table, pq, params);
-        const deleted = await (tx as any).unsafe(sqlText, params);
+        const deleted = await (tx as any).unsafe(sqlText, params, { simple: false });
         if (!returnRepresentation) {
           return new Response(null, { status: 204 });
         }

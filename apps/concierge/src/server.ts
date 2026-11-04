@@ -286,9 +286,29 @@ app.post('/auth/v1/signup', async (c) => {
   if (!email || !password) return c.json({ error: 'invalid_request', error_description: 'email + password gerekli' }, 400);
   if (String(password).length < 8) return c.json({ error: 'weak_password', error_description: 'Şifre en az 8 karakter olmalı' }, 400);
 
+  // 2026-11-03 denetimi: bu uç herkese açıktı — internetten herkes tek istekle hesap
+  // açıp (authenticated) tüm tablolara erişebiliyordu. Artık yalnız bu e-postaya ait
+  // bekleyen bir davet (reseller_invitations) varsa kayıt yapılır; davetsiz vendor
+  // self-servis kaydı kapalı (vendor hesapları elle açılıyor).
+  // Davet token'ı da şart: yalnız e-postaya bakmak, davetlinin adresini bilen birinin
+  // hesabı önce kapmasına izin verirdi. (Login.tsx şu an token'ı göndermiyor → davet
+  // akışı açılana kadar kayıt fiilen kapalı; açılırken signUp options.data.invite_token.)
+  const inviteToken = String(options?.data?.invite_token ?? '');
+  const invited = inviteToken.length < 16 ? [] : await sql<{ id: string }[]>`
+    SELECT id FROM public.reseller_invitations
+    WHERE token = ${inviteToken}
+      AND lower(email) = lower(${String(email).trim()})
+      AND status = 'pending' AND revoked_at IS NULL
+      AND (expires_at IS NULL OR expires_at > now())
+    LIMIT 1
+  `;
+  if (!invited.length) {
+    return c.json({ error: 'signup_disabled', error_description: 'Kayıt yalnızca davetle yapılabilir. Hesap için bizimle iletişime geçin.' }, 403);
+  }
+
   const fullName: string = options?.data?.full_name ?? '';
-  const accountType: string = options?.data?.account_type ?? 'vendor';
-  const role = accountType === 'reseller' ? 'reseller_admin' : 'vendor_owner';
+  // Davetler yalnız reseller içindir → rol body'den seçilmez.
+  const role = 'reseller_admin';
 
   // Mevcut user kontrolü
   const existing = await lookupUserByEmail(String(email));
@@ -461,15 +481,26 @@ app.all('/rest/v1/:table', async (c) => {
 // /rest/v1/rpc/:fn — Postgres function çağrısı
 // ─────────────────────────────────────────────────────────
 const RPC_RE = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
+const ANON_RPC = new Set(['get_reseller_invitation']);
 
 app.post('/rest/v1/rpc/:fn', async (c) => {
   const fn = c.req.param('fn');
   if (!RPC_RE.test(fn)) return c.json({ message: 'invalid rpc', code: 'bad_request' }, 400);
   const auth = requireAuth(c);
+  // 2026-11-03 denetimi: requireAuth'un dönüşü kontrol edilmiyordu ve argüman adları
+  // doğrudan SQL metnine giriyordu → giriş yapmadan SQL enjeksiyonu. CRM'deki
+  // 2026-08-19 düzeltmesinin aynısı. Giriş öncesi tek meşru çağrı davet sayfasının
+  // get_reseller_invitation'ı (admin Login.tsx); storefront rpc kullanmıyor.
+  if (!auth && !ANON_RPC.has(fn)) return c.json({ message: 'Auth gerek', code: 'unauthorized' }, 401);
   let body: Record<string, any> = {};
   try { body = await c.req.json(); } catch {}
-  const params = body && typeof body === 'object' ? body : {};
+  const params = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
   const argNames = Object.keys(params);
+  for (const n of argNames) {
+    if (!RPC_RE.test(n)) {
+      return c.json({ message: `invalid rpc arg name: ${n}`, code: 'bad_request' }, 400);
+    }
+  }
   const argList = argNames.map((n, i) => `"${n}" => $${i + 1}`).join(', ');
   const sqlText = `SELECT public."${fn}"(${argList}) AS result`;
   const ctx = { userId: auth?.userId, role: auth?.role ?? 'anon', email: auth?.email, jwt: auth?.raw };
