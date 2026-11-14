@@ -133,8 +133,14 @@ export function buildSelectSQL(
       case 'like': frag = `${col} LIKE $${params.push(f.value)}`; break;
       case 'ilike': frag = `${col} ILIKE $${params.push(f.value)}`; break;
       case 'is':
+        // 2026-11-03 denetimi: eski `${col} IS ${f.value}` kullanıcı değerini SQL metnine
+        // basıyordu (?id=is.null;UPDATE ... — params boşken simple protocol zincirlemeye
+        // izin verir). CRM'deki 2026-08-19 düzeltmesinin aynısı: katı beyaz liste.
         if (f.value === null) frag = `${col} IS NULL`;
-        else frag = `${col} IS ${f.value}`;
+        else if (f.value === true) frag = `${col} IS TRUE`;
+        else if (f.value === false) frag = `${col} IS FALSE`;
+        else if (f.value === 'unknown') frag = `${col} IS UNKNOWN`;
+        else throw new Error("is operatörü yalnız null, true, false veya unknown kabul eder");
         break;
       case 'in':
         if (Array.isArray(f.value)) {

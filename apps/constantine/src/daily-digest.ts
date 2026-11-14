@@ -24,6 +24,7 @@
 import type { Context } from 'hono';
 import { sql } from './db.js';
 import { sendDigestViaResend } from './digest-sender.js';
+import { filterDigestRecipients } from './digest-allowlist.js';
 import { getDailyForecast, type WeatherSnapshot } from './weather.js';
 import {
   renderDigestByRole,
@@ -108,7 +109,7 @@ async function fetchEligibleUsers(testUserId: string | null): Promise<ProfileRow
       WHERE id = ${testUserId}
       LIMIT 1
     `;
-    return rows;
+    return filterDigestRecipients(rows);
   }
   const rows = await sql<ProfileRow[]>`
     SELECT id, email, full_name, role::text AS role
@@ -117,7 +118,7 @@ async function fetchEligibleUsers(testUserId: string | null): Promise<ProfileRow
       AND email IS NOT NULL
       AND (active IS NULL OR active = TRUE)
   `;
-  return rows;
+  return filterDigestRecipients(rows);
 }
 
 async function fetchManagedBoatIds(user: ProfileRow): Promise<string[]> {

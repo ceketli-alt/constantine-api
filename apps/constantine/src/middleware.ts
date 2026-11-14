@@ -28,6 +28,11 @@ declare module 'hono' {
   }
 }
 
+/** role=anon ya da kullanıcı kimliği (sub) olmayan token = giriş yapılmamış. */
+function isAnonClaims(claims: { sub?: string; role?: string }): boolean {
+  return !claims.role || claims.role === 'anon' || (!claims.sub && claims.role !== 'service_role');
+}
+
 export const authnMiddleware: MiddlewareHandler = async (c, next) => {
   const authHeader = c.req.header('Authorization') || c.req.header('authorization');
   // apikey header'ı: Supabase'in "client identification" — yeni format sb_publishable_*
@@ -40,6 +45,12 @@ export const authnMiddleware: MiddlewareHandler = async (c, next) => {
   if (bearerToken) {
     try {
       const claims = await verifyAnyJWT(bearerToken);
+      // 2026-11-03 denetimi: frontend bundle'ındaki herkese açık anahtar (role=anon)
+      // bizim JWT_SECRET'ımızla imzalı → verify GEÇİYORDU ve `auth` set ediliyordu.
+      // checkTableAccess/requireAuth yalnız `auth` var mı diye baktığı için anahtarı
+      // bundle'dan alan biri giriş yapmış kullanıcı gibi tüm tablolara erişebiliyordu.
+      // anon rolü artık "giriş yapmamış" sayılır (auth set edilmez).
+      if (isAnonClaims(claims)) throw new Error('anon');
       c.set('auth', {
         userId: claims.sub,
         email: claims.email ?? '',
@@ -60,12 +71,15 @@ export const authnMiddleware: MiddlewareHandler = async (c, next) => {
   if (!c.get('auth') && apikeyHeader && apikeyHeader.startsWith('eyJ')) {
     try {
       const claims = await verifyAnyJWT(apikeyHeader);
-      c.set('auth', {
-        userId: claims.sub,
-        email: claims.email ?? '',
-        role: claims.role ?? 'anon',
-        raw: claims.raw,
-      });
+      // apikey yalnız istemci kimliği; anon ise (ya da rolü yoksa) auth set etme.
+      if (!isAnonClaims(claims)) {
+        c.set('auth', {
+          userId: claims.sub,
+          email: claims.email ?? '',
+          role: claims.role as string, // isAnonClaims rolsüzü zaten eledi
+          raw: claims.raw,
+        });
+      }
     } catch {
       // Sessizce anon olarak devam — apikey geçersizse 401 atmıyoruz
     }

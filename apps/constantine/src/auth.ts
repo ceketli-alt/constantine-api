@@ -37,7 +37,7 @@ export interface SessionUser {
 export async function verifyAnyJWT(token: string): Promise<{ sub: string; email?: string; role?: string; raw: string }> {
   // 1. Önce kendi secret'imizle dene
   try {
-    const { payload } = await jwtVerify(token, ourSecret, { algorithms: ['HS256'] });
+    const { payload } = await jwtVerify(token, ourSecret, { algorithms: ['HS256'], clockTolerance: 60 }); // saati geri cihazlar (2026-11-03)
     return { sub: payload.sub as string, email: payload.email as string, role: payload.role as string, raw: JSON.stringify(payload) };
   } catch {}
   // 2. Supabase secret'i varsa onunla dene (geçiş döneminde)
