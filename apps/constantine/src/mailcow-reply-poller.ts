@@ -213,6 +213,28 @@ let pollingNow = false;
 // pollingNow Mailcow grubu için tek-tick guard; multi-host'ta her grup için ayrı.
 const pollingLocks = new Set<string>();
 
+export const HEARTBEAT_PREFIX = 'reply_poller_heartbeat:';
+
+/**
+ * Toplayıcının nabzını app_config'e yaz. Asla throw etmez — nabız yazılamadı diye
+ * cevap toplama durmamalı.
+ */
+export async function recordHeartbeat(
+  sql: any,
+  label: string,
+  beat: { at: string; ok_mailboxes: number; total_mailboxes: number; last_error: string | null },
+): Promise<void> {
+  try {
+    await sql`
+      INSERT INTO app_config (key, value)
+      VALUES (${HEARTBEAT_PREFIX + label}, ${JSON.stringify(beat)})
+      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+    `;
+  } catch (e: any) {
+    console.warn(`[reply-poller:${label}] nabız yazılamadı:`, e?.message);
+  }
+}
+
 /**
  * Bir grubun (config'in) tüm mailbox'larını yokla. Hata izole, throw etmez.
  * Config verilmezse legacy Mailcow grubu env'lerinden oluşturulur (backward compat).
@@ -244,16 +266,29 @@ export async function runReplyPollOnce(
     const { processInboundEmail } = await import('./email-inbound.js');
     const deps: PollDeps = { ImapFlow, simpleParser, sql, processInboundEmail };
     const conn = { host: config.host, port: config.port, maxPerTick: config.maxPerTick };
+    let okMailboxes = 0;
+    let lastError: string | null = null;
     for (const mb of config.mailboxes) {
       try {
         const r = await pollMailbox(mb, deps, conn);
         processed += r.processed;
         tracked += r.tracked;
+        okMailboxes++;
       } catch (e: any) {
+        lastError = `${mb.user}: ${e?.message ?? 'bilinmeyen hata'}`;
         console.warn(`[reply-poller:${config.label}] ${mb.user} bağlantı/poll hata:`, e?.message);
       }
     }
     if (processed > 0) console.log(`[reply-poller:${config.label}] tur bitti: processed=${processed} tracked=${tracked}`);
+    // NABIZ — her turda yaz. 26 Eyl'de Mailcow sertifikası doldu, her kutu hata verdi ama tur
+    // yine "ok" döndü ve toplayıcı 5 gün kör kaldı, kimse görmedi. Günlük özet bu kaydı okur:
+    // son başarılı tur 6 saatten eskiyse ya da kutuların bir kısmı hata veriyorsa kırmızı yazar.
+    await recordHeartbeat(sql, config.label, {
+      at: new Date().toISOString(),
+      ok_mailboxes: okMailboxes,
+      total_mailboxes: config.mailboxes.length,
+      last_error: lastError,
+    });
     return { ok: true, mailboxes: config.mailboxes.length, processed, tracked, label: config.label };
   } finally {
     pollingLocks.delete(config.label);

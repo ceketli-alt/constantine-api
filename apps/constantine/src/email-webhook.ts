@@ -120,6 +120,22 @@ export async function handleResendWebhook(c: Context): Promise<Response> {
       }
     }
 
+    // ─── Giden mailin SMTP Message-ID'sini sakla (8 Eki 2026) ───
+    // Resend/SES Message-ID'yi kendisi atıyor (bizim verdiğimizi EZİYOR — test edildi) ve
+    // bunu yalnızca olay bildiriminde `data.message_id` olarak söylüyor. Eskiden hiçbir yere
+    // yazılmıyordu → 799 giden mailin 799'unda message_id_header boştu → gelen cevabın
+    // In-Reply-To'su hiçbir şeyle eşleşemiyordu. Cevap eşleştirmesi bu alana dayanıyor.
+    // Köşeli parantezsiz saklanır (email-inbound gelen kimlikleri de öyle karşılaştırıyor).
+    const smtpMessageId = typeof body?.data?.message_id === 'string'
+      ? body.data.message_id.replace(/^[<\s]+|[>\s]+$/g, '').trim()
+      : '';
+    if (messageId && smtpMessageId) {
+      await sql`
+        UPDATE email_messages SET message_id_header = ${smtpMessageId}
+        WHERE id = ${messageId} AND direction = 'outbound' AND message_id_header IS NULL
+      `.catch((e: any) => console.warn('[email-webhook] message_id_header yazılamadı:', e?.message));
+    }
+
     if (messageId && (PERSISTED_EVENT_TYPES as readonly string[]).includes(eventType)) {
       // Eşleşen message + enum-geçerli tip → event kaydet (FK NOT NULL + email_event_type cast)
       await sql`
@@ -149,7 +165,14 @@ export async function handleResendWebhook(c: Context): Promise<Response> {
     // send-time'da unsubscribes'i exact-match kontrol eder (channel IN ('email','all')),
     // o yüzden lead'in STORED email'ini identifier yapıyoruz ki ileride tutsun.
     // NOT: 'delivery_delayed' (geçici/soft) suppress EDİLMEZ — sadece kalıcı bounce + complaint.
-    if ((eventType === 'bounced' || eventType === 'complained') && recipientEmail) {
+    // 15 Eki 2026: YALNIZCA KALICI bounce bastırır. Eskiden her 'bounced' olayı (Transient
+    // dahil) adresi kalıcı olarak bastırıp leadi opt-out yapıyordu. 12-14 Eki'de Yandex
+    // içeriği reddetti (Transient/ContentRejected) — adresler sağlamdı, ama 4 acente kalıcı
+    // olarak listeden silindi. Geçici red (içerik, kutu dolu, genel) adresin kötü olduğunu
+    // göstermez; olay kaydedilir, bounce oranına sayılır, ama bastırma YAPILMAZ.
+    const bounceType: string = String(body?.data?.bounce?.type ?? '');
+    const kaliciBounce = eventType === 'bounced' && bounceType !== 'Transient';
+    if ((kaliciBounce || eventType === 'complained') && recipientEmail) {
       const reason = eventType === 'complained' ? 'spam_complaint' : 'hard_bounce';
       try {
         const leadRows = await sql`

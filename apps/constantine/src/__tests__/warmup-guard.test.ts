@@ -36,11 +36,21 @@ describe('warmup duraklatma karari', () => {
     expect(duraklatmaKarari(25, 2, 0).durdur).toBe(true);
   });
 
-  it('sikayet kurali GEVSETILMEDI: dusuk hacimde tek sikayet 72 saat durdurur', () => {
-    const k = duraklatmaKarari(5, 0, 1);
+  it('tek sikayet artik DURDURMAZ (Mert 21 Eki) — gunde 100 gonderimde de, dusuk hacimde de', () => {
+    expect(duraklatmaKarari(100, 0, 1).durdur).toBe(false);
+    expect(duraklatmaKarari(5, 0, 1).durdur).toBe(false);
+  });
+
+  it('24 saatte 2 sikayet + oran > %0,3 → 24 saat durdurur (Mert: 1 gun)', () => {
+    const k = duraklatmaKarari(100, 0, 2);
     expect(k.durdur).toBe(true);
     expect(k.durdur && k.sebep).toBe('complaint_threshold');
-    expect(k.durdur && k.saat).toBe(72);
+    expect(k.durdur && k.saat).toBe(24);
+  });
+
+  it('yuksek hacimde 2 sikayet oran esiginin altindaysa durdurmaz (1000 gonderim → %0,2)', () => {
+    expect(duraklatmaKarari(1000, 0, 2).durdur).toBe(false);
+    expect(duraklatmaKarari(1000, 0, 4).durdur).toBe(true);
   });
 
   it('bounce ve sikayet birlikteyse bounce once degerlendirilir', () => {

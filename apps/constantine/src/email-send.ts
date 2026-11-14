@@ -144,12 +144,15 @@ const HTML_SANITIZE_OPTS: sanitizeHtml.IOptions = {
   },
 };
 
+// Alt bilgideki adres: 8 Eki 2026'ya kadar info@constantineyachts.com idi — o kutu dış
+// hosting'de (Host83) ve şifresi Temmuz'dan beri yok; oraya yazan acentenin maili kayboluyordu.
+// mert@constantineyachts.online cevap toplayıcı tarafından yoklanıyor → CRM'e düşer.
 const FOOTER_HTML = `
 <hr style="margin-top:32px;border:none;border-top:1px solid #e5e5e5"/>
 <p style="font-size:12px;color:#888;margin:8px 0;">
   Constantine Yachts<br/>
   Beşiktaş, İstanbul<br/>
-  <a href="mailto:info@constantineyachts.com">info@constantineyachts.com</a>
+  <a href="mailto:mert@constantineyachts.online">mert@constantineyachts.online</a>
 </p>
 <p style="font-size:11px;color:#aaa;margin:8px 0;">
   Bu mail, Constantine Yachts B2B partner programı kapsamında size gönderilmiştir.
@@ -162,7 +165,7 @@ const FOOTER_TEXT = `
 --
 Constantine Yachts
 Beşiktaş, İstanbul
-info@constantineyachts.com
+mert@constantineyachts.online
 
 Bu mail, Constantine Yachts B2B partner programı kapsamında size gönderilmiştir.
 Abonelikten çıkmak için: {{unsubscribe_url}}
@@ -303,7 +306,7 @@ export async function sendEmailCore(
         // ─── 1. Lead fetch ───────────────────────────────────────────
         const leadRows = await tx`
           SELECT id, primary_contact_email, primary_contact_name, company_name,
-                 status, source_meta, custom_fields, email_thread_id
+                 status, source_meta, custom_fields, email_thread_id, tags
           FROM leads
           WHERE id = ${input.lead_id}
         `;
@@ -540,7 +543,11 @@ export async function sendEmailCore(
           replyTo,
           subject,
           // text-only ise HTML part'ı gönderme (deliverability). DB'de body_html yine saklanır (kayıt).
-          ...(input.text_only ? {} : { html: finalHtml }),
+          // 'duz-metin' etiketli lead HER ZAMAN düz metin alır (15 Eki 2026): Yandex, 8 Eki'de
+          // HTML'e (açılma pikseli) geçince içeriği reddetmeye başladı (Transient/ContentRejected,
+          // 4/4 Yandex; öncesinde hiç yoktu). Düz metin Yandex'ten geçiyordu. Etiketi
+          // scripts/duz-metin-etiketle.mjs MX'e bakarak koyar.
+          ...((input.text_only || (Array.isArray(lead.tags) && lead.tags.includes('duz-metin'))) ? {} : { html: finalHtml }),
           text: finalText,
           tags: [
             { name: 'lead_id', value: lead.id },

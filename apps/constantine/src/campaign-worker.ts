@@ -22,7 +22,7 @@ import { sql } from './db.js';
 import { sendEmailCore } from './email-send.js';
 import { computeAbWinner, type AbVariantStat } from './ab-winner.js';
 import { isWithinSendWindow } from './send-window.js';
-import { capForDay } from './cron-warmup-tick.js';
+import { capForDay, mailboxCount } from './cron-warmup-tick.js';
 
 const TICK_INTERVAL_MS = Number(process.env.CAMPAIGN_WORKER_TICK_MS ?? 60_000);
 const BATCH_SIZE = Number(process.env.CAMPAIGN_WORKER_BATCH_SIZE ?? 10);
@@ -132,6 +132,7 @@ interface CampaignRow {
   segment_filter: any;
   created_by: string | null;
   follow_up_steps: FollowUpStep[] | null;
+  follow_up_only_opened: boolean | null; // takibi yalnızca maili AÇANLARA gönder (8 Eki 2026)
   ab_test_enabled: boolean | null;
   ab_winner_variant: string | null;
   ab_winning_metric: string | null;  // 'auto' | 'reply' | 'open' (G — Faz 2 metrik seçimi)
@@ -275,9 +276,9 @@ const DAY_MS = 86_400_000;
 async function fetchOriginalSend(
   campaignId: string,
   leadId: string,
-): Promise<{ subject: string | null; to_email: string | null }> {
+): Promise<{ subject: string | null; to_email: string | null; message_id_header: string | null; from_email: string | null }> {
   const rows = await sql`
-    SELECT em.subject, em.to_email
+    SELECT em.subject, em.to_email, em.message_id_header, em.from_email
     FROM email_messages em
     JOIN email_threads et ON et.id = em.thread_id
     WHERE em.campaign_id = ${campaignId}
@@ -286,7 +287,12 @@ async function fetchOriginalSend(
     ORDER BY em.sent_at DESC NULLS LAST
     LIMIT 1
   `;
-  return { subject: rows[0]?.subject ?? null, to_email: rows[0]?.to_email ?? null };
+  return {
+    subject: rows[0]?.subject ?? null,
+    to_email: rows[0]?.to_email ?? null,
+    message_id_header: rows[0]?.message_id_header ?? null,
+    from_email: rows[0]?.from_email ?? null,
+  };
 }
 
 /**
@@ -308,6 +314,18 @@ async function processFollowUps(
       AND status = 'sent'
       AND next_followup_at IS NOT NULL
       AND next_followup_at <= now()
+      -- Yalnızca açanlara (açıksa): ilk maili bir İNSANIN açtığı görülmüş olmalı. Gönderimden
+      -- sonraki 120 sn içindeki açılma Apple Mail / güvenlik tarayıcısı ön yüklemesidir, sayılmaz.
+      -- Açmayan seçilmez ama next_followup_at korunur: sonradan açarsa takibini o zaman alır.
+      AND (${campaign.follow_up_only_opened !== true} OR EXISTS (
+        SELECT 1 FROM email_messages m
+        JOIN email_threads th ON th.id = m.thread_id
+        JOIN email_events e ON e.message_id = m.id AND e.event_type = 'opened'
+        WHERE th.lead_id = campaign_targets.lead_id
+          AND m.campaign_id = ${campaign.id}
+          AND m.direction = 'outbound'
+          AND e.occurred_at > m.sent_at + interval '120 seconds'
+      ))
     ORDER BY next_followup_at
     LIMIT ${budget}
   `;
@@ -335,10 +353,17 @@ async function processFollowUps(
       {
         lead_id: t.lead_id,
         template_id: stepCfg.template_id,
-        sender_email: pickSender(campaign, t.lead_id),    // sticky: ilk maille aynı adres
+        // İLK MAİLİ ATAN KUTU (21 Eki 2026): pickSender lead_id hash'ini havuz boyutuna böler;
+        // havuza kutu eklenince/çıkınca dağılım KAYAR ve takip, ilk maili atandan farklı bir
+        // adresten "Re:" olarak giderdi. Gerçek gönderen her zaman önceliklidir.
+        sender_email: orig.from_email ?? pickSender(campaign, t.lead_id),
         campaign_id: campaign.id,
         override_to_email: orig.to_email ?? undefined,   // aynı alıcı
         subject_override: reSubject(orig.subject),        // "Re: <orijinal konu>" → yanıt gibi, aynı thread
+        // Gerçek cevap başlığı (21 Eki 2026): yalnızca "Re:" konusu Outlook'ta aynı konuşmaya
+        // bağlanmıyordu. message_id_header 8 Eki'den beri webhook'tan doluyor (köşeli parantezsiz
+        // saklanır; başlık RFC 5322 gereği <...> ister).
+        in_reply_to: orig.message_id_header ? `<${orig.message_id_header}>` : undefined,
         sequence_step: nextStep,
         variant: normVariant(t.variant),                  // takip de aynı varyant (B template varsa)
         text_only: campaign.send_text_only === true,      // G7 (first_email_text_only sadece step 0 için)
@@ -385,6 +410,9 @@ async function processFollowUps(
  * Phase B — yeni ilk mailler (queued targets). status='sent' olunca trigger
  * (trg_schedule_first_followup) ilk takibi otomatik zamanlar.
  */
+/** Aynı firmaya iki ilk mail arasında en az bu kadar gün (takipler hariç — onların kendi gecikmesi var). */
+const MIN_GUN_ARASI = 7;
+
 async function processInitials(
   campaign: CampaignRow,
   targetRole: string | null,
@@ -402,6 +430,12 @@ async function processInitials(
     WHERE ct.campaign_id = ${campaign.id}
       AND ct.status = 'queued'
       AND (ct.scheduled_at IS NULL OR ct.scheduled_at <= now())
+      -- 22 Eki 2026 (Mert): aynı firmaya 7 günden sık ilk mail gitmez — başka kampanyadan
+      -- yakın zamanda mail aldıysa hedef kuyrukta bekler, süre dolunca kendiliğinden gider.
+      AND NOT EXISTS (
+        SELECT 1 FROM email_messages m JOIN email_threads th ON th.id = m.thread_id
+        WHERE th.lead_id = ct.lead_id AND m.direction = 'outbound'
+          AND m.sent_at > now() - make_interval(days => ${MIN_GUN_ARASI}))
     ORDER BY COALESCE(ct.scheduled_at, ct.created_at)
     LIMIT ${budget}
   `;
@@ -523,7 +557,7 @@ async function processCampaign(campaign: CampaignRow, fallbackUserId: string | n
   if (warmupEnabled) {
     await sql`
       INSERT INTO campaign_warmup_state (campaign_id, warmup_day, current_cap)
-      VALUES (${campaign.id}, 1, ${capForDay(1)})
+      VALUES (${campaign.id}, 1, ${capForDay(1, mailboxCount(campaign.sender_pool))})
       ON CONFLICT (campaign_id) DO NOTHING
     `;
     const wsRows = await sql`
@@ -674,7 +708,7 @@ async function tick(): Promise<void> {
   try {
     const campaignRows: CampaignRow[] = await sql`
       SELECT id, template_id, sender_email, sender_pool, daily_cap, segment_filter, created_by, priority,
-             follow_up_steps, ab_test_enabled, ab_winner_variant, ab_winning_metric,
+             follow_up_steps, follow_up_only_opened, ab_test_enabled, ab_winner_variant, ab_winning_metric,
              send_window_start, send_window_end, send_days, warmup_enabled,
              min_gap_seconds, random_gap_seconds, max_new_leads_per_day, prioritize_new_leads,
              send_text_only, first_email_text_only, max_per_company_per_day, stop_company_on_reply
